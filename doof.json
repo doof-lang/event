@@ -1,0 +1,13 @@
+{
+  "name": "std/event",
+  "version": "0.1.0",
+  "license": "ISC",
+  "build": {
+    "native": {
+      "extraCopyPaths": [
+        "./native_event.hpp"
+      ]
+    }
+  },
+  "dependencies": {}
+}
