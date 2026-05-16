@@ -39,7 +39,7 @@ export class AsyncEventChannel<T> {
 }
 
 export function createMainAsyncEventChannel<T>(
-  handler: (value: T): void,
+  handler: (it: T): void,
   capacity: int = 1024,
   keepsAlive: bool = true,
 ): AsyncEventChannel<T> {

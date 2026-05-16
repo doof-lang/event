@@ -5,7 +5,7 @@ import { AsyncEventChannelError, createMainAsyncEventChannel, runMainEventLoop }
 export function testMainAsyncEventChannelDispatchesQueuedValues(): void {
   let handled: int[] = []
   events := createMainAsyncEventChannel{
-    handler: (value: int): void => handled.push(value),
+    handler: (event: int): void => handled.push(event),
     capacity: 4,
     keepsAlive: false,
   }
@@ -24,7 +24,7 @@ export function testMainAsyncEventChannelDispatchesQueuedValues(): void {
 
 export function testMainAsyncEventChannelReportsFull(): void {
   events := createMainAsyncEventChannel<int>{
-    handler: (value: int): void => {},
+    handler: (event: int): void => {},
     capacity: 1,
     keepsAlive: false,
   }
@@ -42,7 +42,7 @@ export function testMainAsyncEventChannelReportsFull(): void {
 
 export function testMainAsyncEventChannelReportsClosed(): void {
   events := createMainAsyncEventChannel<int>{
-    handler: (value: int): void => {},
+    handler: (event: int): void => {},
     capacity: 1,
     keepsAlive: false,
   }
