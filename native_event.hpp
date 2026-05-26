@@ -32,7 +32,7 @@ public:
 
     int32_t trySend(
         const std::shared_ptr<NativeAsyncEventChannel>& channel,
-        std::function<void()> task
+        doof::callback<void()> task
     );
 
     bool tryClose(NativeAsyncEventChannel& channel);
@@ -65,7 +65,7 @@ public:
         (void)tryClose();
     }
 
-    int32_t trySend(std::function<void()> task) {
+    int32_t trySend(doof::callback<void()> task) {
         return detail::MainEventDispatcher::shared().trySend(shared_from_this(), std::move(task));
     }
 
@@ -85,12 +85,12 @@ private:
     bool keepsAlive_;
     bool closed_ = false;
     bool scheduled_ = false;
-    std::deque<std::function<void()>> tasks_;
+    std::deque<doof::callback<void()>> tasks_;
 };
 
 inline int32_t detail::MainEventDispatcher::trySend(
     const std::shared_ptr<NativeAsyncEventChannel>& channel,
-    std::function<void()> task
+    doof::callback<void()> task
 ) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -133,7 +133,7 @@ inline bool detail::MainEventDispatcher::tryClose(NativeAsyncEventChannel& chann
 }
 
 inline bool detail::MainEventDispatcher::waitAndDispatchOne() {
-    std::function<void()> task;
+    doof::callback<void()> task;
     {
         std::unique_lock<std::mutex> lock(mutex_);
         ready_.wait(lock, [this] {
@@ -157,7 +157,7 @@ inline bool detail::MainEventDispatcher::waitAndDispatchOne() {
         }
     }
 
-    task();
+    task.call();
     return true;
 }
 
