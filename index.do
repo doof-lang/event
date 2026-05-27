@@ -4,10 +4,18 @@
 // the public wrapper contains only readonly fields, while the mutable queue and
 // wakeup machinery live inside native code.
 
+import { Duration } from "std/time"
+
 import class NativeAsyncEventChannel from "native_event.hpp" as doof_event::NativeAsyncEventChannel {
   static create(capacity: int, keepsAlive: bool): NativeAsyncEventChannel
   trySend(task: (): void): int
   tryClose(): bool
+}
+
+import class NativeTimer from "native_event.hpp" as doof_event::NativeTimer {
+  static createTimeout(delayNanos: long, keepsAlive: bool, handler: (): void): NativeTimer
+  static createInterval(intervalNanos: long, keepsAlive: bool, handler: (): void): NativeTimer
+  cancel(): bool
 }
 
 import function _runMainEventLoop(): void from "native_event.hpp" as doof_event::runMainEventLoop
@@ -51,6 +59,38 @@ export function createMainAsyncEventChannel<T>(
     NativeAsyncEventChannel.create(capacity, keepsAlive),
     handler,
   )
+}
+
+export class Timer {
+  private readonly native: NativeTimer
+
+  cancel(): bool {
+    return this.native.cancel()
+  }
+}
+
+export function setTimeout(
+  delay: Duration,
+  handler: (): void,
+  keepsAlive: bool = true,
+): Timer {
+  if delay.isNegative() {
+    panic("setTimeout delay must not be negative")
+  }
+
+  return Timer(NativeTimer.createTimeout(delay.toNanos(), keepsAlive, handler))
+}
+
+export function setInterval(
+  interval: Duration,
+  handler: (): void,
+  keepsAlive: bool = true,
+): Timer {
+  if interval.toNanos() <= 0L {
+    panic("setInterval interval must be positive")
+  }
+
+  return Timer(NativeTimer.createInterval(interval.toNanos(), keepsAlive, handler))
 }
 
 // First-cut explicit pump for hosts that do not yet have runtime integration.

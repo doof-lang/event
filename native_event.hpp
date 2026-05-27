@@ -4,17 +4,32 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 namespace doof_event {
 
 class NativeAsyncEventChannel;
+class NativeTimer;
 
 namespace detail {
+
+enum class TimerKind {
+    Timeout,
+    Interval,
+};
+
+enum class TimerState {
+    Scheduled,
+    Dispatching,
+    Canceled,
+    Completed,
+};
 
 class MainEventDispatcher {
 public:
@@ -23,12 +38,7 @@ public:
         return dispatcher;
     }
 
-    void registerChannel(bool keepsAlive) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (keepsAlive) {
-            ++keepAliveCount_;
-        }
-    }
+    void addKeepAliveSource(bool keepsAlive);
 
     int32_t trySend(
         const std::shared_ptr<NativeAsyncEventChannel>& channel,
@@ -37,14 +47,25 @@ public:
 
     bool tryClose(NativeAsyncEventChannel& channel);
 
+    void startTimer(const std::shared_ptr<NativeTimer>& timer);
+
+    bool cancelTimer(NativeTimer& timer);
+
+    void commitTimer(const std::shared_ptr<NativeTimer>& timer);
+
+    void finishTimerTick(NativeTimer& timer);
+
     bool waitAndDispatchOne();
 
 private:
     MainEventDispatcher() = default;
 
+    void removeKeepAliveSourceLocked(bool keepsAlive);
+
     std::mutex mutex_;
     std::condition_variable ready_;
     std::deque<std::shared_ptr<NativeAsyncEventChannel>> readyChannels_;
+    std::deque<doof::callback<void()>> readyTasks_;
     int64_t keepAliveCount_ = 0;
 };
 
@@ -78,7 +99,7 @@ private:
 
     explicit NativeAsyncEventChannel(int32_t capacity, bool keepsAlive)
         : capacity_(capacity), keepsAlive_(keepsAlive) {
-        detail::MainEventDispatcher::shared().registerChannel(keepsAlive_);
+        detail::MainEventDispatcher::shared().addKeepAliveSource(keepsAlive_);
     }
 
     int32_t capacity_;
@@ -87,6 +108,79 @@ private:
     bool scheduled_ = false;
     std::deque<doof::callback<void()>> tasks_;
 };
+
+class NativeTimer : public std::enable_shared_from_this<NativeTimer> {
+public:
+    static std::shared_ptr<NativeTimer> createTimeout(
+        int64_t delayNanos,
+        bool keepsAlive,
+        doof::callback<void()> handler
+    ) {
+        if (delayNanos < 0) {
+            doof::panic("setTimeout delay must not be negative");
+        }
+
+        auto timer = std::shared_ptr<NativeTimer>(
+            new NativeTimer(delayNanos, detail::TimerKind::Timeout, keepsAlive, std::move(handler))
+        );
+        detail::MainEventDispatcher::shared().startTimer(timer);
+        return timer;
+    }
+
+    static std::shared_ptr<NativeTimer> createInterval(
+        int64_t intervalNanos,
+        bool keepsAlive,
+        doof::callback<void()> handler
+    ) {
+        if (intervalNanos <= 0) {
+            doof::panic("setInterval interval must be positive");
+        }
+
+        auto timer = std::shared_ptr<NativeTimer>(
+            new NativeTimer(intervalNanos, detail::TimerKind::Interval, keepsAlive, std::move(handler))
+        );
+        detail::MainEventDispatcher::shared().startTimer(timer);
+        return timer;
+    }
+
+    bool cancel() {
+        return detail::MainEventDispatcher::shared().cancelTimer(*this);
+    }
+
+private:
+    friend class detail::MainEventDispatcher;
+
+    NativeTimer(
+        int64_t periodNanos,
+        detail::TimerKind kind,
+        bool keepsAlive,
+        doof::callback<void()> handler
+    ) : periodNanos_(periodNanos),
+        kind_(kind),
+        keepsAlive_(keepsAlive),
+        handler_(std::move(handler)) {
+    }
+
+    int64_t periodNanos_;
+    detail::TimerKind kind_;
+    bool keepsAlive_;
+    bool countedKeepAlive_ = false;
+    detail::TimerState state_ = detail::TimerState::Scheduled;
+    doof::callback<void()> handler_;
+};
+
+inline void detail::MainEventDispatcher::addKeepAliveSource(bool keepsAlive) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (keepsAlive) {
+        ++keepAliveCount_;
+    }
+}
+
+inline void detail::MainEventDispatcher::removeKeepAliveSourceLocked(bool keepsAlive) {
+    if (keepsAlive && keepAliveCount_ > 0) {
+        --keepAliveCount_;
+    }
+}
 
 inline int32_t detail::MainEventDispatcher::trySend(
     const std::shared_ptr<NativeAsyncEventChannel>& channel,
@@ -121,9 +215,7 @@ inline bool detail::MainEventDispatcher::tryClose(NativeAsyncEventChannel& chann
 
         channel.closed_ = true;
         removedKeepAlive = channel.keepsAlive_;
-        if (removedKeepAlive && keepAliveCount_ > 0) {
-            --keepAliveCount_;
-        }
+        removeKeepAliveSourceLocked(removedKeepAlive);
     }
 
     if (removedKeepAlive) {
@@ -132,28 +224,130 @@ inline bool detail::MainEventDispatcher::tryClose(NativeAsyncEventChannel& chann
     return true;
 }
 
+inline void detail::MainEventDispatcher::startTimer(const std::shared_ptr<NativeTimer>& timer) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (timer->state_ != TimerState::Scheduled) {
+            return;
+        }
+        if (timer->keepsAlive_ && !timer->countedKeepAlive_) {
+            timer->countedKeepAlive_ = true;
+            ++keepAliveCount_;
+        }
+    }
+
+    std::thread([timer] {
+        auto delay = std::chrono::nanoseconds(timer->periodNanos_);
+        if (delay.count() > 0) {
+            std::this_thread::sleep_for(delay);
+        }
+        detail::MainEventDispatcher::shared().commitTimer(timer);
+    }).detach();
+}
+
+inline bool detail::MainEventDispatcher::cancelTimer(NativeTimer& timer) {
+    bool removedKeepAlive = false;
+    bool canceled = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (timer.state_ == TimerState::Scheduled) {
+            timer.state_ = TimerState::Canceled;
+            canceled = true;
+        } else if (
+            timer.kind_ == TimerKind::Interval &&
+            timer.state_ == TimerState::Dispatching
+        ) {
+            timer.state_ = TimerState::Canceled;
+            canceled = true;
+        }
+
+        if (canceled && timer.countedKeepAlive_) {
+            timer.countedKeepAlive_ = false;
+            removedKeepAlive = true;
+            removeKeepAliveSourceLocked(true);
+        }
+    }
+
+    if (removedKeepAlive) {
+        ready_.notify_all();
+    }
+    return canceled;
+}
+
+inline void detail::MainEventDispatcher::commitTimer(const std::shared_ptr<NativeTimer>& timer) {
+    bool shouldNotify = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (timer->state_ != TimerState::Scheduled) {
+            return;
+        }
+
+        timer->state_ = TimerState::Dispatching;
+        if (timer->kind_ == TimerKind::Timeout && timer->countedKeepAlive_) {
+            timer->countedKeepAlive_ = false;
+            removeKeepAliveSourceLocked(true);
+        }
+
+        readyTasks_.push_back([timer] {
+            timer->handler_.call();
+            detail::MainEventDispatcher::shared().finishTimerTick(*timer);
+        });
+        shouldNotify = true;
+    }
+
+    if (shouldNotify) {
+        ready_.notify_one();
+    }
+}
+
+inline void detail::MainEventDispatcher::finishTimerTick(NativeTimer& timer) {
+    if (timer.kind_ == TimerKind::Timeout) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (timer.state_ == TimerState::Dispatching) {
+            timer.state_ = TimerState::Completed;
+        }
+        return;
+    }
+
+    bool shouldRestart = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (timer.state_ == TimerState::Dispatching) {
+            timer.state_ = TimerState::Scheduled;
+            shouldRestart = true;
+        }
+    }
+
+    if (shouldRestart) {
+        startTimer(timer.shared_from_this());
+    }
+}
+
 inline bool detail::MainEventDispatcher::waitAndDispatchOne() {
     doof::callback<void()> task;
     {
         std::unique_lock<std::mutex> lock(mutex_);
         ready_.wait(lock, [this] {
-            return !readyChannels_.empty() || keepAliveCount_ == 0;
+            return !readyTasks_.empty() || !readyChannels_.empty() || keepAliveCount_ == 0;
         });
 
-        if (readyChannels_.empty()) {
+        if (!readyTasks_.empty()) {
+            task = std::move(readyTasks_.front());
+            readyTasks_.pop_front();
+        } else if (!readyChannels_.empty()) {
+            auto channel = std::move(readyChannels_.front());
+            readyChannels_.pop_front();
+            channel->scheduled_ = false;
+
+            task = std::move(channel->tasks_.front());
+            channel->tasks_.pop_front();
+
+            if (!channel->tasks_.empty()) {
+                channel->scheduled_ = true;
+                readyChannels_.push_back(std::move(channel));
+            }
+        } else {
             return false;
-        }
-
-        auto channel = std::move(readyChannels_.front());
-        readyChannels_.pop_front();
-        channel->scheduled_ = false;
-
-        task = std::move(channel->tasks_.front());
-        channel->tasks_.pop_front();
-
-        if (!channel->tasks_.empty()) {
-            channel->scheduled_ = true;
-            readyChannels_.push_back(std::move(channel));
         }
     }
 
