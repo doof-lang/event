@@ -19,6 +19,9 @@ import class NativeTimer from "native_event.hpp" as doof_event::NativeTimer {
 }
 
 import function _runMainEventLoop(): void from "native_event.hpp" as doof_event::runMainEventLoop
+import function _drainMainEventLoop(): int from "native_event.hpp" as doof_event::drainMainEventLoop
+import function _setMainEventWakeHandler(handler: (): void): void from "native_event.hpp" as doof_event::setMainEventWakeCallback
+import function _clearMainEventWakeHandler(): void from "native_event.hpp" as doof_event::clearMainEventWakeHandler
 
 export enum AsyncEventChannelError {
   Full,
@@ -99,4 +102,19 @@ export function setInterval(
 // channels remain and the ready queue has drained.
 export function runMainEventLoop(): void {
   _runMainEventLoop()
+}
+
+// Drains all currently-ready main-loop work without blocking.
+// This is intended for OS-owned hosts that need to integrate std/event work
+// into another event loop.
+export function drainMainEventLoop(): int {
+  return _drainMainEventLoop()
+}
+
+export function setMainEventWakeHandler(handler: (): void): void {
+  _setMainEventWakeHandler(handler)
+}
+
+export function clearMainEventWakeHandler(): void {
+  _clearMainEventWakeHandler()
 }

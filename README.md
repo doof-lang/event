@@ -69,6 +69,24 @@ This is the first-cut explicit host hook. Longer term, ordinary applications
 should not need to expose an event-loop concept directly; generated hosts can
 call the same runtime seam themselves.
 
+### `drainMainEventLoop()`
+
+```doof
+count := drainMainEventLoop()
+```
+
+Dispatches all currently-ready main-loop work without blocking and returns the
+number of handlers that ran. This is primarily for native hosts that own an OS
+event loop, such as a windowing or game runtime, and need to integrate
+`std/event` work into that loop.
+
+### `setMainEventWakeHandler(...)` / `clearMainEventWakeHandler()`
+
+Installs or clears a host wake callback. The callback is invoked when new
+main-loop work becomes ready, so an OS-owned event loop can post back to its
+main thread and call `drainMainEventLoop()`. Ordinary applications should not
+need these functions directly.
+
 ### `Timer`
 
 ```doof

@@ -55,18 +55,25 @@ public:
 
     void finishTimerTick(NativeTimer& timer);
 
+    int32_t drainReady();
+
     bool waitAndDispatchOne();
+
+    void setWakeHandler(std::function<void()> handler);
 
 private:
     MainEventDispatcher() = default;
 
     void removeKeepAliveSourceLocked(bool keepsAlive);
+    bool takeReadyTaskLocked(doof::callback<void()>& task);
+    void notifyReady();
 
     std::mutex mutex_;
     std::condition_variable ready_;
     std::deque<std::shared_ptr<NativeAsyncEventChannel>> readyChannels_;
     std::deque<doof::callback<void()>> readyTasks_;
     int64_t keepAliveCount_ = 0;
+    std::function<void()> wakeHandler_;
 };
 
 }  // namespace detail
@@ -201,7 +208,7 @@ inline int32_t detail::MainEventDispatcher::trySend(
             readyChannels_.push_back(channel);
         }
     }
-    ready_.notify_one();
+    notifyReady();
     return 0;  // Accepted
 }
 
@@ -219,7 +226,7 @@ inline bool detail::MainEventDispatcher::tryClose(NativeAsyncEventChannel& chann
     }
 
     if (removedKeepAlive) {
-        ready_.notify_all();
+        notifyReady();
     }
     return true;
 }
@@ -269,7 +276,7 @@ inline bool detail::MainEventDispatcher::cancelTimer(NativeTimer& timer) {
     }
 
     if (removedKeepAlive) {
-        ready_.notify_all();
+        notifyReady();
     }
     return canceled;
 }
@@ -296,7 +303,7 @@ inline void detail::MainEventDispatcher::commitTimer(const std::shared_ptr<Nativ
     }
 
     if (shouldNotify) {
-        ready_.notify_one();
+        notifyReady();
     }
 }
 
@@ -323,6 +330,47 @@ inline void detail::MainEventDispatcher::finishTimerTick(NativeTimer& timer) {
     }
 }
 
+inline bool detail::MainEventDispatcher::takeReadyTaskLocked(doof::callback<void()>& task) {
+    if (!readyTasks_.empty()) {
+        task = std::move(readyTasks_.front());
+        readyTasks_.pop_front();
+        return true;
+    }
+
+    if (!readyChannels_.empty()) {
+        auto channel = std::move(readyChannels_.front());
+        readyChannels_.pop_front();
+        channel->scheduled_ = false;
+
+        task = std::move(channel->tasks_.front());
+        channel->tasks_.pop_front();
+
+        if (!channel->tasks_.empty()) {
+            channel->scheduled_ = true;
+            readyChannels_.push_back(std::move(channel));
+        }
+        return true;
+    }
+
+    return false;
+}
+
+inline int32_t detail::MainEventDispatcher::drainReady() {
+    int32_t dispatched = 0;
+    while (true) {
+        doof::callback<void()> task;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!takeReadyTaskLocked(task)) {
+                return dispatched;
+            }
+        }
+
+        task.call();
+        ++dispatched;
+    }
+}
+
 inline bool detail::MainEventDispatcher::waitAndDispatchOne() {
     doof::callback<void()> task;
     {
@@ -331,22 +379,7 @@ inline bool detail::MainEventDispatcher::waitAndDispatchOne() {
             return !readyTasks_.empty() || !readyChannels_.empty() || keepAliveCount_ == 0;
         });
 
-        if (!readyTasks_.empty()) {
-            task = std::move(readyTasks_.front());
-            readyTasks_.pop_front();
-        } else if (!readyChannels_.empty()) {
-            auto channel = std::move(readyChannels_.front());
-            readyChannels_.pop_front();
-            channel->scheduled_ = false;
-
-            task = std::move(channel->tasks_.front());
-            channel->tasks_.pop_front();
-
-            if (!channel->tasks_.empty()) {
-                channel->scheduled_ = true;
-                readyChannels_.push_back(std::move(channel));
-            }
-        } else {
+        if (!takeReadyTaskLocked(task)) {
             return false;
         }
     }
@@ -355,9 +388,45 @@ inline bool detail::MainEventDispatcher::waitAndDispatchOne() {
     return true;
 }
 
+inline void detail::MainEventDispatcher::setWakeHandler(std::function<void()> handler) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    wakeHandler_ = std::move(handler);
+}
+
+inline void detail::MainEventDispatcher::notifyReady() {
+    std::function<void()> wakeHandler;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        wakeHandler = wakeHandler_;
+    }
+
+    ready_.notify_all();
+    if (wakeHandler) {
+        wakeHandler();
+    }
+}
+
 inline void runMainEventLoop() {
     while (detail::MainEventDispatcher::shared().waitAndDispatchOne()) {
     }
+}
+
+inline int32_t drainMainEventLoop() {
+    return detail::MainEventDispatcher::shared().drainReady();
+}
+
+inline void setMainEventWakeHandler(std::function<void()> handler) {
+    detail::MainEventDispatcher::shared().setWakeHandler(std::move(handler));
+}
+
+inline void setMainEventWakeCallback(doof::callback<void()> handler) {
+    detail::MainEventDispatcher::shared().setWakeHandler([handler]() mutable {
+        handler.call();
+    });
+}
+
+inline void clearMainEventWakeHandler() {
+    detail::MainEventDispatcher::shared().setWakeHandler(nullptr);
 }
 
 }  // namespace doof_event

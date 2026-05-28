@@ -5,6 +5,7 @@ import {
   AsyncEventChannelError,
   Timer,
   createMainAsyncEventChannel,
+  drainMainEventLoop,
   runMainEventLoop,
   setInterval,
   setTimeout,
@@ -62,6 +63,30 @@ export function testMainAsyncEventChannelReportsClosed(): void {
     s: Success -> Assert.fail("expected send after close to fail")
     f: Failure -> Assert.equal(f.error, AsyncEventChannelError.Closed)
   }
+}
+
+export function testDrainMainEventLoopDispatchesReadyValuesWithoutBlocking(): void {
+  let handled: int[] = []
+  events := createMainAsyncEventChannel{
+    handler: (event: int): void => handled.push(event),
+    capacity: 4,
+    keepsAlive: false,
+  }
+
+  try! events.send(10)
+  try! events.send(20)
+
+  dispatched := drainMainEventLoop()
+
+  Assert.equal(dispatched, 2)
+  Assert.equal(handled.length, 2)
+  Assert.equal(handled[0], 10)
+  Assert.equal(handled[1], 20)
+  Assert.equal(drainMainEventLoop(), 0)
+}
+
+export function testDrainMainEventLoopReturnsZeroWhenNoWorkIsReady(): void {
+  Assert.equal(drainMainEventLoop(), 0)
 }
 
 export function testTimeoutFiresOnce(): void {
