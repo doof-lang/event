@@ -1,14 +1,17 @@
 // Event delivery primitives for Doof programs.
-//
-// `AsyncEventChannel<T>` is conceptually immutable from Doof's point of view:
-// the public wrapper contains only readonly fields, while the mutable queue and
-// wakeup machinery live inside native code.
 
 import { Duration } from "std/time"
 
-import class NativeAsyncEventChannel from "native_event.hpp" as doof_event::NativeAsyncEventChannel {
-  static create(capacity: int, keepsAlive: bool): NativeAsyncEventChannel
-  trySend(task: (): void): int
+import class NativeChannel from "native_event.hpp" as doof_event::NativeChannel {
+  static createChannel(
+    capacity: int,
+    highWater: int,
+    lowWater: int,
+    keepsAlive: bool,
+    readyHandler: (): void,
+    closedHandler: (): void,
+  ): NativeChannel
+  trySendMessage(task: (): void, hasKey: bool, key: string): int
   tryClose(): bool
 }
 
@@ -23,45 +26,83 @@ import function _drainMainEventLoop(): int from "native_event.hpp" as doof_event
 import function _setMainEventWakeHandler(handler: (): void): void from "native_event.hpp" as doof_event::setMainEventWakeCallback
 import function _clearMainEventWakeHandler(): void from "native_event.hpp" as doof_event::clearMainEventWakeHandler
 
-export enum AsyncEventChannelError {
+export enum Backpressure {
+  None,
+  High,
+}
+
+export enum SendError {
   Full,
   Closed,
 }
 
-export class AsyncEventChannel<T> {
-  private readonly native: NativeAsyncEventChannel
-  private readonly handler: (value: T): void
+export class ChannelMessage<T> {
+  readonly value: T
+}
 
-  send(value: T): Result<void, AsyncEventChannelError> {
-    code := this.native.trySend((): void => this.handler(value))
+export class ChannelReady<T> {}
+
+export class ChannelClosed<T> {}
+
+export class Channel<T> {
+  private readonly native: NativeChannel
+  private readonly handler: (event: ChannelMessage<T> | ChannelReady<T> | ChannelClosed<T>): void
+
+  send(value: T, key: string | null = null): Result<Backpressure, SendError> {
+    code := if key == null then this.native.trySendMessage(
+      (): void => this.handler(ChannelMessage<T> { value }),
+      false,
+      "",
+    ) else this.native.trySendMessage(
+      (): void => this.handler(ChannelMessage<T> { value }),
+      true,
+      key!,
+    )
+
     return case code {
-      0 -> Success {},
-      1 -> Failure { error: AsyncEventChannelError.Full },
-      _ -> Failure { error: AsyncEventChannelError.Closed },
+      0 -> Success { value: Backpressure.None },
+      1 -> Success { value: Backpressure.High },
+      2 -> Failure { error: SendError.Full },
+      _ -> Failure { error: SendError.Closed },
     }
   }
 
-  close(): Result<void, AsyncEventChannelError> {
-    if this.native.tryClose() {
-      return Success {}
-    }
-    return Failure { error: AsyncEventChannelError.Closed }
+  close(): void {
+    this.native.tryClose()
   }
 }
 
-export function createMainAsyncEventChannel<T>(
-  handler: (it: T): void,
-  capacity: int = 1024,
+export function createChannel<T>(
+  handler: (event: ChannelMessage<T> | ChannelReady<T> | ChannelClosed<T>): void,
+  capacity: int = 256,
+  highWater: int = 0,
+  lowWater: int = -1,
   keepsAlive: bool = true,
-): AsyncEventChannel<T> {
+): Channel<T> {
   if capacity <= 0 {
-    panic("AsyncEventChannel capacity must be positive")
+    panic("Channel capacity must be positive")
+  }
+  actualHighWater := if highWater == 0 then capacity else highWater
+  actualLowWater := if lowWater < 0 then actualHighWater \ 2 else lowWater
+
+  if actualHighWater <= 0 || actualHighWater > capacity {
+    panic("Channel highWater must be between 1 and capacity")
+  }
+  if actualLowWater < 0 || actualLowWater > actualHighWater {
+    panic("Channel lowWater must be between 0 and highWater")
   }
 
-  return AsyncEventChannel<T>(
-    NativeAsyncEventChannel.create(capacity, keepsAlive),
+  return Channel<T> {
+    native: NativeChannel.createChannel(
+      capacity,
+      actualHighWater,
+      actualLowWater,
+      keepsAlive,
+      (): void => handler(ChannelReady<T> {}),
+      (): void => handler(ChannelClosed<T> {}),
+    ),
     handler,
-  )
+  }
 }
 
 export class Timer {

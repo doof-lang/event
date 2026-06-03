@@ -1,22 +1,27 @@
 # std/event
 
 `std/event` provides event-delivery primitives for Doof programs:
-`AsyncEventChannel<T>` and scheduled timers.
+`Channel<T>` and scheduled timers.
 
-An async event channel accepts immutable values from producers and delivers them
-serially to a handler on the owning application thread. The Doof wrapper is
-conceptually immutable; mutable queue state and wakeup bookkeeping are held in
-native code.
+Channels accept immutable values from producers and deliver them serially to a
+handler on the owning application thread. Mutable queue state and wakeup
+bookkeeping are held in native code.
 
 ## Usage
 
 ```doof
-import { createMainAsyncEventChannel, runMainEventLoop, setTimeout } from "std/event"
+import { ChannelClosed, ChannelMessage, ChannelReady, createChannel, runMainEventLoop, setTimeout } from "std/event"
 import { Duration } from "std/time"
 
 function main(): int {
-  events := createMainAsyncEventChannel{
-    handler: (message: string): void => println(message),
+  events := createChannel{
+    handler: (event: ChannelMessage<string> | ChannelReady<string> | ChannelClosed<string>): void => {
+      case event {
+        message: ChannelMessage<string> -> println(message.value)
+        _: ChannelReady<string> -> {}
+        _: ChannelClosed<string> -> {}
+      }
+    },
     capacity: 256,
     keepsAlive: false,
   }
@@ -34,31 +39,59 @@ function main(): int {
 
 ## Exports
 
-### `AsyncEventChannel<T>`
+### `Channel<T>`
 
 ```doof
-send(value: T): Result<void, AsyncEventChannelError>
-close(): Result<void, AsyncEventChannelError>
+enum Backpressure { None, High }
+enum SendError { Full, Closed }
+
+class ChannelMessage<T> { readonly value: T }
+class ChannelReady<T> {}
+class ChannelClosed<T> {}
+
+createChannel{ ... }: Channel<T>
+send(value: T, key: string | null = null): Result<Backpressure, SendError>
+close(): void
 ```
 
-`send(...)` is nonblocking. It returns:
-
-- `Success {}` when the value was accepted;
-- `Failure { error: .Full }` when the bounded queue is at capacity;
-- `Failure { error: .Closed }` after the channel has been closed.
-
-### `createMainAsyncEventChannel{ ... }`
+`Channel<T>` is a bounded, nonblocking ingress point for bidirectional event
+sources such as native websocket integrations and future cross-thread
+communication. Values sent through channels are intended to be immutable when
+they cross native or thread boundaries; the current compiler does not yet expose
+an `Immutable` generic constraint, so this is documented as an API contract
+rather than encoded in the type parameter.
 
 ```doof
-createMainAsyncEventChannel{
-  handler: (value: T): void => ...,
-  capacity: 1024,
-  keepsAlive: true,
+events := createChannel{
+  capacity: 256,
+  highWater: 192,
+  lowWater: 128,
+  handler: (event: ChannelMessage<string> | ChannelReady<string> | ChannelClosed<string>): void => {
+    case event {
+      message: ChannelMessage<string> -> println(message.value),
+      _: ChannelReady<string> -> println("ready for more"),
+      _: ChannelClosed<string> -> println("closed"),
+    }
+  },
 }
 ```
 
-Creates a channel whose handler is dispatched by the main application event
-pump. Capacity must be positive.
+`send(...)` returns `Backpressure.None` while the queue remains below
+`highWater`, and `Backpressure.High` once the queued message count reaches or
+exceeds `highWater`. If the queue is already at capacity, it fails with
+`SendError.Full`; after `close()`, it fails with `SendError.Closed`.
+
+When a non-null `key` is supplied, a pending message with the same key is
+replaced in place instead of consuming another capacity slot. The original FIFO
+position for that key is preserved. Unkeyed messages are always appended.
+
+After high backpressure has been reported, the handler receives one
+`ChannelReady` event when dispatch lowers queued depth to `lowWater` or below.
+`close()` stops accepting new messages immediately, drains pending messages, and
+then delivers one `ChannelClosed` event. Repeated `close()` calls are no-ops.
+
+When omitted, `highWater` defaults to the channel capacity and `lowWater`
+defaults to half of the effective `highWater`.
 
 ### `runMainEventLoop()`
 

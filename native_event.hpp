@@ -9,12 +9,13 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 
 namespace doof_event {
 
-class NativeAsyncEventChannel;
+class NativeChannel;
 class NativeTimer;
 
 namespace detail {
@@ -40,12 +41,14 @@ public:
 
     void addKeepAliveSource(bool keepsAlive);
 
-    int32_t trySend(
-        const std::shared_ptr<NativeAsyncEventChannel>& channel,
-        doof::callback<void()> task
+    int32_t trySendMessage(
+        const std::shared_ptr<NativeChannel>& channel,
+        doof::callback<void()> task,
+        bool hasKey,
+        const std::string& key
     );
 
-    bool tryClose(NativeAsyncEventChannel& channel);
+    bool tryClose(NativeChannel& channel);
 
     void startTimer(const std::shared_ptr<NativeTimer>& timer);
 
@@ -70,7 +73,7 @@ private:
 
     std::mutex mutex_;
     std::condition_variable ready_;
-    std::deque<std::shared_ptr<NativeAsyncEventChannel>> readyChannels_;
+    std::deque<std::shared_ptr<NativeChannel>> readyChannels_;
     std::deque<doof::callback<void()>> readyTasks_;
     int64_t keepAliveCount_ = 0;
     std::function<void()> wakeHandler_;
@@ -78,23 +81,49 @@ private:
 
 }  // namespace detail
 
-class NativeAsyncEventChannel : public std::enable_shared_from_this<NativeAsyncEventChannel> {
+class NativeChannel : public std::enable_shared_from_this<NativeChannel> {
 public:
-    static std::shared_ptr<NativeAsyncEventChannel> create(int32_t capacity, bool keepsAlive) {
+    static std::shared_ptr<NativeChannel> createChannel(
+        int32_t capacity,
+        int32_t highWater,
+        int32_t lowWater,
+        bool keepsAlive,
+        doof::callback<void()> readyHandler,
+        doof::callback<void()> closedHandler
+    ) {
         if (capacity <= 0) {
-            doof::panic("event channel capacity must be positive");
+            doof::panic("Channel capacity must be positive");
         }
-        return std::shared_ptr<NativeAsyncEventChannel>(
-            new NativeAsyncEventChannel(capacity, keepsAlive)
+        if (highWater <= 0 || highWater > capacity) {
+            doof::panic("Channel highWater must be between 1 and capacity");
+        }
+        if (lowWater < 0 || lowWater > highWater) {
+            doof::panic("Channel lowWater must be between 0 and highWater");
+        }
+
+        return std::shared_ptr<NativeChannel>(
+            new NativeChannel(
+                capacity,
+                highWater,
+                lowWater,
+                keepsAlive,
+                std::move(readyHandler),
+                std::move(closedHandler)
+            )
         );
     }
 
-    ~NativeAsyncEventChannel() {
+    ~NativeChannel() {
         (void)tryClose();
     }
 
-    int32_t trySend(doof::callback<void()> task) {
-        return detail::MainEventDispatcher::shared().trySend(shared_from_this(), std::move(task));
+    int32_t trySendMessage(doof::callback<void()> task, bool hasKey, const std::string& key) {
+        return detail::MainEventDispatcher::shared().trySendMessage(
+            shared_from_this(),
+            std::move(task),
+            hasKey,
+            key
+        );
     }
 
     bool tryClose() {
@@ -104,16 +133,49 @@ public:
 private:
     friend class detail::MainEventDispatcher;
 
-    explicit NativeAsyncEventChannel(int32_t capacity, bool keepsAlive)
-        : capacity_(capacity), keepsAlive_(keepsAlive) {
+    NativeChannel(
+        int32_t capacity,
+        int32_t highWater,
+        int32_t lowWater,
+        bool keepsAlive,
+        doof::callback<void()> readyHandler,
+        doof::callback<void()> closedHandler
+    ) : capacity_(capacity),
+        highWater_(highWater),
+        lowWater_(lowWater),
+        keepsAlive_(keepsAlive),
+        readyHandler_(std::move(readyHandler)),
+        closedHandler_(std::move(closedHandler)),
+        sendsReadyAndClosed_(true) {
         detail::MainEventDispatcher::shared().addKeepAliveSource(keepsAlive_);
     }
 
+    enum class TaskKind {
+        Message,
+        Ready,
+        Closed,
+    };
+
+    struct QueuedTask {
+        TaskKind kind;
+        bool hasKey;
+        std::string key;
+        doof::callback<void()> task;
+    };
+
     int32_t capacity_;
+    int32_t highWater_ = 0;
+    int32_t lowWater_ = 0;
     bool keepsAlive_;
     bool closed_ = false;
     bool scheduled_ = false;
-    std::deque<doof::callback<void()>> tasks_;
+    bool sendsReadyAndClosed_ = false;
+    bool waitingForReady_ = false;
+    bool closedQueued_ = false;
+    int32_t messageCount_ = 0;
+    doof::callback<void()> readyHandler_;
+    doof::callback<void()> closedHandler_;
+    std::deque<QueuedTask> tasks_;
 };
 
 class NativeTimer : public std::enable_shared_from_this<NativeTimer> {
@@ -189,31 +251,70 @@ inline void detail::MainEventDispatcher::removeKeepAliveSourceLocked(bool keepsA
     }
 }
 
-inline int32_t detail::MainEventDispatcher::trySend(
-    const std::shared_ptr<NativeAsyncEventChannel>& channel,
-    doof::callback<void()> task
+inline int32_t detail::MainEventDispatcher::trySendMessage(
+    const std::shared_ptr<NativeChannel>& channel,
+    doof::callback<void()> task,
+    bool hasKey,
+    const std::string& key
 ) {
+    bool shouldNotify = false;
+    int32_t code = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (channel->closed_) {
-            return 2;  // Closed
-        }
-        if (static_cast<int64_t>(channel->tasks_.size()) >= static_cast<int64_t>(channel->capacity_)) {
-            return 1;  // Full
+            return 3;  // Closed
         }
 
-        channel->tasks_.push_back(std::move(task));
+        if (hasKey) {
+            for (auto& queued : channel->tasks_) {
+                if (
+                    queued.kind == NativeChannel::TaskKind::Message &&
+                    queued.hasKey &&
+                    queued.key == key
+                ) {
+                    queued.task = std::move(task);
+                    if (channel->messageCount_ >= channel->highWater_) {
+                        channel->waitingForReady_ = true;
+                        return 1;  // Accepted, high backpressure
+                    }
+                    return 0;  // Accepted
+                }
+            }
+        }
+
+        if (channel->messageCount_ >= channel->capacity_) {
+            return 2;  // Full
+        }
+
+        channel->tasks_.push_back(NativeChannel::QueuedTask {
+            NativeChannel::TaskKind::Message,
+            hasKey,
+            key,
+            std::move(task),
+        });
+        ++channel->messageCount_;
+
+        if (channel->messageCount_ >= channel->highWater_) {
+            channel->waitingForReady_ = true;
+            code = 1;  // Accepted, high backpressure
+        }
+
         if (!channel->scheduled_) {
             channel->scheduled_ = true;
             readyChannels_.push_back(channel);
+            shouldNotify = true;
         }
     }
-    notifyReady();
-    return 0;  // Accepted
+
+    if (shouldNotify) {
+        notifyReady();
+    }
+    return code;
 }
 
-inline bool detail::MainEventDispatcher::tryClose(NativeAsyncEventChannel& channel) {
+inline bool detail::MainEventDispatcher::tryClose(NativeChannel& channel) {
     bool removedKeepAlive = false;
+    bool shouldNotify = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (channel.closed_) {
@@ -223,9 +324,27 @@ inline bool detail::MainEventDispatcher::tryClose(NativeAsyncEventChannel& chann
         channel.closed_ = true;
         removedKeepAlive = channel.keepsAlive_;
         removeKeepAliveSourceLocked(removedKeepAlive);
+
+        if (channel.sendsReadyAndClosed_ && !channel.closedQueued_) {
+            auto self = channel.weak_from_this().lock();
+            if (self) {
+                channel.closedQueued_ = true;
+                channel.tasks_.push_back(NativeChannel::QueuedTask {
+                    NativeChannel::TaskKind::Closed,
+                    false,
+                    std::string(),
+                    std::move(channel.closedHandler_),
+                });
+                if (!channel.scheduled_) {
+                    channel.scheduled_ = true;
+                    readyChannels_.push_back(std::move(self));
+                    shouldNotify = true;
+                }
+            }
+        }
     }
 
-    if (removedKeepAlive) {
+    if (removedKeepAlive || shouldNotify) {
         notifyReady();
     }
     return true;
@@ -342,8 +461,25 @@ inline bool detail::MainEventDispatcher::takeReadyTaskLocked(doof::callback<void
         readyChannels_.pop_front();
         channel->scheduled_ = false;
 
-        task = std::move(channel->tasks_.front());
+        auto queued = std::move(channel->tasks_.front());
         channel->tasks_.pop_front();
+        task = std::move(queued.task);
+
+        if (queued.kind == NativeChannel::TaskKind::Message) {
+            --channel->messageCount_;
+            if (
+                channel->waitingForReady_ &&
+                channel->messageCount_ <= channel->lowWater_
+            ) {
+                channel->waitingForReady_ = false;
+                channel->tasks_.push_front(NativeChannel::QueuedTask {
+                    NativeChannel::TaskKind::Ready,
+                    false,
+                    std::string(),
+                    channel->readyHandler_,
+                });
+            }
+        }
 
         if (!channel->tasks_.empty()) {
             channel->scheduled_ = true;
