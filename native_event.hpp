@@ -415,7 +415,7 @@ inline void detail::MainEventDispatcher::commitTimer(const std::shared_ptr<Nativ
         }
 
         readyTasks_.push_back([timer] {
-            timer->handler_.call();
+            doof::detail::call_callback_unchecked(timer->handler_);
             detail::MainEventDispatcher::shared().finishTimerTick(*timer);
         });
         shouldNotify = true;
@@ -502,7 +502,7 @@ inline int32_t detail::MainEventDispatcher::drainReady() {
             }
         }
 
-        task.call();
+        doof::detail::call_callback_unchecked(task);
         ++dispatched;
     }
 }
@@ -520,7 +520,7 @@ inline bool detail::MainEventDispatcher::waitAndDispatchOne() {
         }
     }
 
-    task.call();
+    doof::detail::call_callback_unchecked(task);
     return true;
 }
 
@@ -557,7 +557,7 @@ inline void setMainEventWakeHandler(std::function<void()> handler) {
 
 inline void setMainEventWakeCallback(doof::callback<void()> handler) {
     detail::MainEventDispatcher::shared().setWakeHandler([handler]() mutable {
-        handler.call();
+        handler.dispatch();
     });
 }
 

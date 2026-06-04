@@ -26,6 +26,64 @@ function collectIntChannelEvents(target: int[]): (event: ChannelMessage<int> | C
   }
 }
 
+class ActorChannelState {
+  values: int[] = []
+  timer: Timer | null = null
+
+  openChannel(
+    capacity: int = 4,
+    highWater: int = 4,
+    lowWater: int = 2,
+  ): Channel<int> {
+    return createChannel<int>{
+      handler: (event: ChannelMessage<int> | ChannelReady<int> | ChannelClosed<int>): void => {
+        case event {
+          message: ChannelMessage<int> -> this.values.push(message.value)
+          _: ChannelReady<int> -> this.values.push(-1)
+          _: ChannelClosed<int> -> this.values.push(-2)
+        }
+      },
+      capacity,
+      highWater,
+      lowWater,
+      keepsAlive: false,
+    }
+  }
+
+  mark(value: int): void {
+    this.values.push(value)
+  }
+
+  startTimeout(): void {
+    setTimeout{
+      delay: Duration.ZERO,
+      handler: (): void => this.values.push(90),
+      keepsAlive: true,
+    }
+  }
+
+  startInterval(): void {
+    this.timer = setInterval{
+      interval: Duration.ofMillis(1L),
+      handler: (): void => {
+        this.values.push(91)
+        this.timer!.cancel()
+      },
+      keepsAlive: true,
+    }
+  }
+
+  count(): int => this.values.length
+
+  at(index: int): int => this.values[index]
+}
+
+class ActorChannelSender {
+  deliver(events: Channel<int>, value: int): void {
+    try! events.send(value)
+  }
+}
+
 export function testDrainMainEventLoopDispatchesReadyValuesWithoutBlocking(): void {
   let handled: int[] = []
   events := createChannel<int>{
@@ -50,6 +108,103 @@ export function testDrainMainEventLoopDispatchesReadyValuesWithoutBlocking(): vo
 
 export function testDrainMainEventLoopReturnsZeroWhenNoWorkIsReady(): void {
   Assert.equal(drainMainEventLoop(), 0)
+}
+
+export function testActorOwnedChannelDispatchesMessageOnOwningActor(): void {
+  owner := Actor<ActorChannelState>()
+  events := owner.openChannel()
+
+  try! events.send(42)
+  Assert.equal(drainMainEventLoop(), 1)
+
+  Assert.equal(owner.count(), 1)
+  Assert.equal(owner.at(0), 42)
+
+  events.close()
+  Assert.equal(drainMainEventLoop(), 1)
+  retired := retire owner
+}
+
+export function testActorOwnedChannelPreservesMailboxOrdering(): void {
+  owner := Actor<ActorChannelState>()
+  events := owner.openChannel()
+
+  first := async owner.mark(1)
+  try! events.send(2)
+  Assert.equal(drainMainEventLoop(), 1)
+  last := async owner.mark(3)
+
+  try! first.get()
+  try! last.get()
+
+  Assert.equal(owner.count(), 3)
+  Assert.equal(owner.at(0), 1)
+  Assert.equal(owner.at(1), 2)
+  Assert.equal(owner.at(2), 3)
+
+  events.close()
+  Assert.equal(drainMainEventLoop(), 1)
+  retired := retire owner
+}
+
+export function testActorOwnedChannelDispatchesReadyAndClosedOnOwningActor(): void {
+  owner := Actor<ActorChannelState>()
+  events := owner.openChannel(3, 2, 0)
+
+  try! events.send(10)
+  high := try! events.send(20)
+  Assert.equal(high, Backpressure.High)
+  events.close()
+
+  Assert.equal(drainMainEventLoop(), 4)
+  Assert.equal(owner.count(), 4)
+  Assert.equal(owner.at(0), 10)
+  Assert.equal(owner.at(1), 20)
+  Assert.equal(owner.at(2), -1)
+  Assert.equal(owner.at(3), -2)
+
+  retired := retire owner
+}
+
+export function testActorOwnedChannelAcceptsSendFromAnotherActor(): void {
+  owner := Actor<ActorChannelState>()
+  sender := Actor<ActorChannelSender>()
+  events := owner.openChannel()
+
+  sender.deliver(events, 77)
+  Assert.equal(drainMainEventLoop(), 1)
+
+  Assert.equal(owner.count(), 1)
+  Assert.equal(owner.at(0), 77)
+
+  events.close()
+  Assert.equal(drainMainEventLoop(), 1)
+  retiredSender := retire sender
+  retiredOwner := retire owner
+}
+
+export function testTimeoutCreatedInsideActorDispatchesOnOwningActor(): void {
+  owner := Actor<ActorChannelState>()
+
+  owner.startTimeout()
+  runMainEventLoop()
+
+  Assert.equal(owner.count(), 1)
+  Assert.equal(owner.at(0), 90)
+
+  retired := retire owner
+}
+
+export function testIntervalCreatedInsideActorDispatchesOnOwningActor(): void {
+  owner := Actor<ActorChannelState>()
+
+  owner.startInterval()
+  runMainEventLoop()
+
+  Assert.equal(owner.count(), 1)
+  Assert.equal(owner.at(0), 91)
+
+  retired := retire owner
 }
 
 export function testChannelDispatchesQueuedMessages(): void {

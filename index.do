@@ -49,12 +49,13 @@ export class Channel<T> {
   private readonly handler: (event: ChannelMessage<T> | ChannelReady<T> | ChannelClosed<T>): void
 
   send(value: T, key: string | null = null): Result<Backpressure, SendError> {
+    eventHandler := this.handler
     code := if key == null then this.native.trySendMessage(
-      (): void => this.handler(ChannelMessage<T> { value }),
+      (): void => eventHandler.dispatch(ChannelMessage<T> { value }),
       false,
       "",
     ) else this.native.trySendMessage(
-      (): void => this.handler(ChannelMessage<T> { value }),
+      (): void => eventHandler.dispatch(ChannelMessage<T> { value }),
       true,
       key!,
     )
@@ -92,14 +93,15 @@ export function createChannel<T>(
     panic("Channel lowWater must be between 0 and highWater")
   }
 
+  eventHandler := handler
   return Channel<T> {
     native: NativeChannel.createChannel(
       capacity,
       actualHighWater,
       actualLowWater,
       keepsAlive,
-      (): void => handler(ChannelReady<T> {}),
-      (): void => handler(ChannelClosed<T> {}),
+      (): void => eventHandler.dispatch(ChannelReady<T> {}),
+      (): void => eventHandler.dispatch(ChannelClosed<T> {}),
     ),
     handler,
   }
@@ -122,7 +124,8 @@ export function setTimeout(
     panic("setTimeout delay must not be negative")
   }
 
-  return Timer(NativeTimer.createTimeout(delay.toNanos(), keepsAlive, handler))
+  timerHandler := handler
+  return Timer(NativeTimer.createTimeout(delay.toNanos(), keepsAlive, (): void => timerHandler.dispatch()))
 }
 
 export function setInterval(
@@ -134,7 +137,8 @@ export function setInterval(
     panic("setInterval interval must be positive")
   }
 
-  return Timer(NativeTimer.createInterval(interval.toNanos(), keepsAlive, handler))
+  timerHandler := handler
+  return Timer(NativeTimer.createInterval(interval.toNanos(), keepsAlive, (): void => timerHandler.dispatch()))
 }
 
 // First-cut explicit pump for hosts that do not yet have runtime integration.
