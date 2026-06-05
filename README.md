@@ -1,37 +1,47 @@
 # std/event
 
-`std/event` provides event-delivery primitives for Doof programs:
-`Channel<T>` and scheduled timers.
+`std/event` provides event-delivery primitives for Doof programs: one-way
+channels for handing work to an endpoint, explicit main-loop pumping hooks, and
+scheduled timers.
 
-Channels accept immutable values from producers and deliver them serially to a
-handler on the owning application thread. Mutable queue state and wakeup
-bookkeeping are held in native code.
+Channels are bounded queues split into two endpoint objects. A
+`ChannelSender<T>` can enqueue values, observe backpressure, and close the
+queue. A `ChannelReceiver<T>` can install the message handler, observe closure,
+and close the same queue from the receiving side. The channel itself is not a
+bidirectional conversation: values only flow from sender to receiver. If a
+protocol needs replies or two independent streams, create a second channel and
+pass the opposite endpoints to the participating actors or native integrations.
+
+This endpoint split is useful when ownership matters. A native listener can
+hold only the sender for inbound requests, an actor can hold only the receiver
+for actor-affine callbacks, and a producer can react to `onReady` without being
+able to consume messages.
 
 ## Usage
 
 ```doof
-import { ChannelClosed, ChannelMessage, ChannelReady, createChannel, runMainEventLoop, setTimeout } from "std/event"
+import { createChannel, runMainEventLoop, setTimeout } from "std/event"
 import { Duration } from "std/time"
 
 function main(): int {
-  events := createChannel{
-    handler: (event: ChannelMessage<string> | ChannelReady<string> | ChannelClosed<string>): void => {
-      case event {
-        message: ChannelMessage<string> -> println(message.value)
-        _: ChannelReady<string> -> {}
-        _: ChannelClosed<string> -> {}
-      }
-    },
+  (sender, receiver) := createChannel<string>{
     capacity: 256,
     keepsAlive: false,
   }
 
+  receiver.onMessage((message: string): void => println(message))
+  receiver.onClosed((): void => println("receiver closed"))
+  sender.onReady((): void => println("ready for more"))
+  sender.onClosed((): void => println("sender closed"))
+
   timer := setTimeout{
     delay: Duration.ofMillis(100L),
-    handler: (): void => try! events.send("hello from a timer"),
+    handler: (): void => try! sender.send("hello from a timer"),
   }
 
-  try! events.send("hello from the event queue")
+  try! sender.send("hello from the event queue")
+  sender.close()
+
   runMainEventLoop()
   return 0
 }
@@ -39,56 +49,65 @@ function main(): int {
 
 ## Exports
 
-### `Channel<T>`
+### Channels
 
 ```doof
 enum Backpressure { None, High }
 enum SendError { Full, Closed }
 
-class ChannelMessage<T> { readonly value: T }
-class ChannelReady<T> {}
-class ChannelClosed<T> {}
+class ChannelSender<T> {
+  send(value: T, key: string | null = null): Result<Backpressure, SendError>
+  onReady(handler: (): void): void
+  onClosed(handler: (): void): void
+  close(): void
+}
 
-createChannel{ ... }: Channel<T>
-send(value: T, key: string | null = null): Result<Backpressure, SendError>
-close(): void
+class ChannelReceiver<T> {
+  onMessage(handler: (value: T): void): void
+  onClosed(handler: (): void): void
+  close(): void
+}
+
+createChannel{ ... }: Tuple<ChannelSender<T>, ChannelReceiver<T>>
 ```
 
-`Channel<T>` is a bounded, nonblocking ingress point for bidirectional event
-sources such as native websocket integrations and future cross-thread
-communication. Values sent through channels are intended to be immutable when
-they cross native or thread boundaries; the current compiler does not yet expose
-an `Immutable` generic constraint, so this is documented as an API contract
-rather than encoded in the type parameter.
+Channels are bounded, nonblocking ingress points for handing immutable values to
+an endpoint. They are a good fit for native event sources, producer-to-actor
+handoff, and future cross-thread communication. Values sent through channels are
+intended to be immutable when they cross native or thread boundaries; the
+current compiler does not yet expose an `Immutable` generic constraint, so this
+is documented as an API contract rather than encoded in the type parameter.
 
 ```doof
-events := createChannel{
+(sender, receiver) := createChannel<string>{
   capacity: 256,
   highWater: 192,
   lowWater: 128,
-  handler: (event: ChannelMessage<string> | ChannelReady<string> | ChannelClosed<string>): void => {
-    case event {
-      message: ChannelMessage<string> -> println(message.value),
-      _: ChannelReady<string> -> println("ready for more"),
-      _: ChannelClosed<string> -> println("closed"),
-    }
-  },
 }
+
+receiver.onMessage((message: string): void => println(message))
+sender.onReady((): void => println("ready for more"))
 ```
 
-`send(...)` returns `Backpressure.None` while the queue remains below
-`highWater`, and `Backpressure.High` once the queued message count reaches or
-exceeds `highWater`. If the queue is already at capacity, it fails with
+`ChannelSender.send(...)` returns `Backpressure.None` while the queue remains
+below `highWater`, and `Backpressure.High` once the queued message count reaches
+or exceeds `highWater`. If the queue is already at capacity, it fails with
 `SendError.Full`; after `close()`, it fails with `SendError.Closed`.
 
 When a non-null `key` is supplied, a pending message with the same key is
 replaced in place instead of consuming another capacity slot. The original FIFO
 position for that key is preserved. Unkeyed messages are always appended.
 
-After high backpressure has been reported, the handler receives one
-`ChannelReady` event when dispatch lowers queued depth to `lowWater` or below.
-`close()` stops accepting new messages immediately, drains pending messages, and
-then delivers one `ChannelClosed` event. Repeated `close()` calls are no-ops.
+After high backpressure has been reported, the sender receives one `onReady`
+callback when dispatch lowers queued depth to `lowWater` or below. Sending
+before `receiver.onMessage(...)` is registered is allowed; messages remain
+buffered until the receiver endpoint installs its message handler.
+
+`close()` on either endpoint stops accepting new messages immediately. Pending
+messages drain to the receiver, then `receiver.onClosed(...)` is delivered.
+`sender.onClosed(...)` is delivered to the sender endpoint. Repeated `close()`
+calls are no-ops, and ready/closed notifications that occur before their
+callback is registered are delivered after registration.
 
 When omitted, `highWater` defaults to the channel capacity and `lowWater`
 defaults to half of the effective `highWater`.
@@ -96,11 +115,11 @@ defaults to half of the effective `highWater`.
 ### `runMainEventLoop()`
 
 Blocks efficiently on the calling thread, dispatching queued handlers until no
-keep-alive channels remain open and the ready queue has drained.
+keep-alive channels or timers remain open and the ready queue has drained.
 
 This is the first-cut explicit host hook. Longer term, ordinary applications
 should not need to expose an event-loop concept directly; generated hosts can
-call the same runtime seam themselves.
+call the same runtime hook themselves.
 
 ### `drainMainEventLoop()`
 

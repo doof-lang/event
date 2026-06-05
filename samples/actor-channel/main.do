@@ -1,9 +1,8 @@
 import {
-  Channel,
-  ChannelClosed,
-  ChannelMessage,
-  ChannelReady,
+  ChannelReceiver,
+  ChannelSender,
   createChannel,
+  runMainEventLoop
 } from "std/event"
 import { Duration, Instant, Thread } from "std/time"
 
@@ -19,38 +18,66 @@ class ConsoleActor {
     Thread.sleep(Duration.ofSeconds(5L))
     log("actor", "woke up")
   }
-  openChannel(): Channel<string> {
-    return createChannel<string>{
-      handler: (event: ChannelMessage<string> | ChannelReady<string> | ChannelClosed<string>): void => {
-        case event {
-          message: ChannelMessage<string> -> log("actor", message.value)
-          _: ChannelReady<string> -> log("actor", "ready for more")
-          _: ChannelClosed<string> -> log("actor", "channel closed")
-        }
-      },
-      capacity: 16,
-      highWater: 12,
-      keepsAlive: false,
-    }
+  attachReceiver(receiver: ChannelReceiver<string>): void {
+    receiver.onMessage((message: string): void => log("actor", message))
+    receiver.onClosed((): void => log("actor", "channel closed"))
   }
 }
 
+class Producer {
+  idx = 0
+  sender: ChannelSender<string>
+  totalMessages: int
+
+  pump() {
+    while (idx <= totalMessages) {
+      sent := sender.send("message ${idx}") else {
+        log("producer", "failed to send message ${idx}")
+        break
+      }
+      if sent == .High {
+        log("producer", "backpressure applied at message ${idx}")
+        break
+      }
+      idx += 1
+    } then {
+      log("producer", "finished sending messages")
+      sender.close()
+    }
+  }
+
+
+
+}
+
 function main(): int {
+  let idx = 0
+
   actor := Actor<ConsoleActor>()
-  inbox := actor.openChannel()
+  (sender, receiver) := createChannel<string>{
+    capacity: 16,
+    highWater: 12,
+    keepsAlive: true,
+  }
+
+  actor.attachReceiver(receiver)
+
+  producer := Producer { sender, totalMessages: 4 }
+  sender.onReady((): void => producer.pump())
+  sender.onClosed((): void => log("main", "channel closed"))
   async actor.sleep()
 
   log("main", "sending messages")
-  for idx of 1..20 {
-    println(inbox.send("message ${idx}"))
-  }
 
-  log("main", "sleeping for 10 seconds")
-  Thread.sleep(Duration.ofSeconds(10L))
+  producer.pump()
+
+  log("main", "sleeping for 2 seconds")
+  Thread.sleep(Duration.ofSeconds(2L))
   log("main", "woke up")
+runMainEventLoop()
 
-  inbox.close()
+//  sender.close()
 
-  retired := retire actor
-  return 0
+  //retired := retire actor
+  //return 0
 }

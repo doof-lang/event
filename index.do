@@ -8,12 +8,24 @@ import class NativeChannel from "native_event.hpp" as doof_event::NativeChannel 
     highWater: int,
     lowWater: int,
     keepsAlive: bool,
-    readyHandler: (): void,
-    closedHandler: (): void,
   ): NativeChannel
-  trySendMessage(task: (): void, hasKey: bool, key: string): int
+  registerSenderReady(handler: (): void): void
+  registerSenderClosed(handler: (): void): void
+  registerReceiverClosed(handler: (): void): void
   tryClose(): bool
 }
+
+import function _trySendChannelMessage<T>(
+  channel: NativeChannel,
+  value: T,
+  hasKey: bool,
+  key: string,
+): int from "native_event.hpp" as doof_event::trySendChannelMessage
+
+import function _registerChannelReceiverMessage<T>(
+  channel: NativeChannel,
+  handler: (value: T): void,
+): void from "native_event.hpp" as doof_event::registerChannelReceiverMessage
 
 import class NativeTimer from "native_event.hpp" as doof_event::NativeTimer {
   static createTimeout(delayNanos: long, keepsAlive: bool, handler: (): void): NativeTimer
@@ -36,29 +48,11 @@ export enum SendError {
   Closed,
 }
 
-export class ChannelMessage<T> {
-  readonly value: T
-}
-
-export class ChannelReady<T> {}
-
-export class ChannelClosed<T> {}
-
-export class Channel<T> {
+export class ChannelSender<T> {
   private readonly native: NativeChannel
-  private readonly handler: (event: ChannelMessage<T> | ChannelReady<T> | ChannelClosed<T>): void
 
   send(value: T, key: string | null = null): Result<Backpressure, SendError> {
-    eventHandler := this.handler
-    code := if key == null then this.native.trySendMessage(
-      (): void => eventHandler.call(ChannelMessage<T> { value }),
-      false,
-      "",
-    ) else this.native.trySendMessage(
-      (): void => eventHandler.call(ChannelMessage<T> { value }),
-      true,
-      key!,
-    )
+    code := if key == null then _trySendChannelMessage(this.native, value, false, "") else _trySendChannelMessage(this.native, value, true, key!)
 
     return case code {
       0 -> Success { value: Backpressure.None },
@@ -68,18 +62,41 @@ export class Channel<T> {
     }
   }
 
+  onReady(handler: (): void): void {
+    this.native.registerSenderReady(handler)
+  }
+
+  onClosed(handler: (): void): void {
+    this.native.registerSenderClosed(handler)
+  }
+
+  close(): void {
+    this.native.tryClose()
+  }
+}
+
+export class ChannelReceiver<T> {
+  private readonly native: NativeChannel
+
+  onMessage(handler: (value: T): void): void {
+    _registerChannelReceiverMessage(this.native, handler)
+  }
+
+  onClosed(handler: (): void): void {
+    this.native.registerReceiverClosed(handler)
+  }
+
   close(): void {
     this.native.tryClose()
   }
 }
 
 export function createChannel<T>(
-  handler: (event: ChannelMessage<T> | ChannelReady<T> | ChannelClosed<T>): void,
   capacity: int = 256,
   highWater: int = 0,
   lowWater: int = -1,
   keepsAlive: bool = true,
-): Channel<T> {
+): Tuple<ChannelSender<T>, ChannelReceiver<T> > {
   if capacity <= 0 {
     panic("Channel capacity must be positive")
   }
@@ -93,18 +110,11 @@ export function createChannel<T>(
     panic("Channel lowWater must be between 0 and highWater")
   }
 
-  eventHandler := handler
-  return Channel<T> {
-    native: NativeChannel.createChannel(
-      capacity,
-      actualHighWater,
-      actualLowWater,
-      keepsAlive,
-      (): void => eventHandler.call(ChannelReady<T> {}),
-      (): void => eventHandler.call(ChannelClosed<T> {}),
-    ),
-    handler,
-  }
+  native := NativeChannel.createChannel(capacity, actualHighWater, actualLowWater, keepsAlive)
+  return (
+    ChannelSender<T> { native },
+    ChannelReceiver<T> { native },
+  )
 }
 
 export class Timer {

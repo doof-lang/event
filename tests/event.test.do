@@ -3,10 +3,8 @@ import { Duration, Thread } from "std/time"
 
 import {
   Backpressure,
-  Channel,
-  ChannelClosed,
-  ChannelMessage,
-  ChannelReady,
+  ChannelReceiver,
+  ChannelSender,
   SendError,
   Timer,
   createChannel,
@@ -16,13 +14,9 @@ import {
   setTimeout,
 } from "../index"
 
-function collectIntChannelEvents(target: int[]): (event: ChannelMessage<int> | ChannelReady<int> | ChannelClosed<int>): void {
-  return (event: ChannelMessage<int> | ChannelReady<int> | ChannelClosed<int>): void => {
-    case event {
-      message: ChannelMessage<int> -> target.push(message.value)
-      _: ChannelReady<int> -> target.push(-1)
-      _: ChannelClosed<int> -> target.push(-2)
-    }
+function collectIntMessages(target: int[]): (value: int): void {
+  return (value: int): void => {
+    target.push(value)
   }
 }
 
@@ -34,20 +28,21 @@ class ActorChannelState {
     capacity: int = 4,
     highWater: int = 4,
     lowWater: int = 2,
-  ): Channel<int> {
-    return createChannel<int>{
-      handler: (event: ChannelMessage<int> | ChannelReady<int> | ChannelClosed<int>): void => {
-        case event {
-          message: ChannelMessage<int> -> this.values.push(message.value)
-          _: ChannelReady<int> -> this.values.push(-1)
-          _: ChannelClosed<int> -> this.values.push(-2)
-        }
-      },
+  ): Tuple<ChannelSender<int>, ChannelReceiver<int> > {
+    (sender, receiver) := createChannel<int>{
       capacity,
       highWater,
       lowWater,
       keepsAlive: false,
     }
+    receiver.onMessage((value: int): void => this.values.push(value))
+    receiver.onClosed((): void => this.values.push(-2))
+    return (sender, receiver)
+  }
+
+  attachReceiver(receiver: ChannelReceiver<int>): void {
+    receiver.onMessage((value: int): void => this.values.push(value))
+    receiver.onClosed((): void => this.values.push(-2))
   }
 
   mark(value: int): void {
@@ -83,27 +78,38 @@ class ActorChannelState {
 }
 
 class ActorChannelSender {
-  deliver(events: Channel<int>, value: int): void {
-    try! events.send(value)
+  values: int[] = []
+
+  attachSender(sender: ChannelSender<int>): void {
+    sender.onReady((): void => this.values.push(-1))
+    sender.onClosed((): void => this.values.push(-2))
+  }
+
+  deliver(sender: ChannelSender<int>, value: int): void {
+    try! sender.send(value)
   }
 
   dispatch(callback: (): void): void {
     callback.dispatch()
   }
+
+  count(): int => this.values.length
+
+  at(index: int): int => this.values[index]
 }
 
 export function testDrainMainEventLoopDispatchesReadyValuesWithoutBlocking(): void {
   let handled: int[] = []
-  events := createChannel<int>{
-    handler: collectIntChannelEvents(handled),
+  (sender, receiver) := createChannel<int>{
     capacity: 4,
     highWater: 4,
     lowWater: 2,
     keepsAlive: false,
   }
+  receiver.onMessage(collectIntMessages(handled))
 
-  try! events.send(10)
-  try! events.send(20)
+  try! sender.send(10)
+  try! sender.send(20)
 
   dispatched := drainMainEventLoop()
 
@@ -120,25 +126,25 @@ export function testDrainMainEventLoopReturnsZeroWhenNoWorkIsReady(): void {
 
 export function testActorOwnedChannelDispatchesMessageOnOwningActor(): void {
   owner := Actor<ActorChannelState>()
-  events := owner.openChannel()
+  (sender, receiver) := owner.openChannel()
 
-  try! events.send(42)
+  try! sender.send(42)
   Assert.equal(drainMainEventLoop(), 0)
 
   Assert.equal(owner.count(), 1)
   Assert.equal(owner.at(0), 42)
 
-  events.close()
+  receiver.close()
   Assert.equal(owner.count(), 2)
   retired := retire owner
 }
 
 export function testActorOwnedChannelPreservesMailboxOrdering(): void {
   owner := Actor<ActorChannelState>()
-  events := owner.openChannel()
+  (sender, receiver) := owner.openChannel()
 
   first := async owner.mark(1)
-  try! events.send(2)
+  try! sender.send(2)
   Assert.equal(drainMainEventLoop(), 0)
   last := async owner.mark(3)
 
@@ -150,43 +156,42 @@ export function testActorOwnedChannelPreservesMailboxOrdering(): void {
   Assert.equal(owner.at(1), 2)
   Assert.equal(owner.at(2), 3)
 
-  events.close()
+  receiver.close()
   Assert.equal(owner.count(), 4)
   retired := retire owner
 }
 
-export function testActorOwnedChannelDispatchesReadyAndClosedOnOwningActor(): void {
+export function testActorOwnedChannelDispatchesClosedOnOwningReceiver(): void {
   owner := Actor<ActorChannelState>()
-  events := owner.openChannel(3, 2, 0)
+  (sender, receiver) := owner.openChannel(3, 2, 0)
 
-  try! events.send(10)
-  high := try! events.send(20)
+  try! sender.send(10)
+  high := try! sender.send(20)
   Assert.equal(high, Backpressure.High)
-  events.close()
+  receiver.close()
 
-  Assert.equal(owner.count(), 4)
+  Assert.equal(owner.count(), 3)
   Assert.equal(owner.at(0), 10)
   Assert.equal(owner.at(1), 20)
-  Assert.equal(owner.at(2), -1)
-  Assert.equal(owner.at(3), -2)
+  Assert.equal(owner.at(2), -2)
 
   retired := retire owner
 }
 
 export function testActorOwnedChannelAcceptsSendFromAnotherActor(): void {
   owner := Actor<ActorChannelState>()
-  sender := Actor<ActorChannelSender>()
-  events := owner.openChannel()
+  senderActor := Actor<ActorChannelSender>()
+  (sender, receiver) := owner.openChannel()
 
-  sender.deliver(events, 77)
+  senderActor.deliver(sender, 77)
   Assert.equal(drainMainEventLoop(), 0)
 
   Assert.equal(owner.count(), 1)
   Assert.equal(owner.at(0), 77)
 
-  events.close()
+  receiver.close()
   Assert.equal(owner.count(), 2)
-  retiredSender := retire sender
+  retiredSender := retire senderActor
   retiredOwner := retire owner
 }
 
@@ -208,28 +213,30 @@ export function testRootCallbackDispatchedFromActorRunsOnMainDrain(): void {
 
 export function testActorOwnedChannelDoesNotNeedMainDrainWhileMainSleeps(): void {
   owner := Actor<ActorChannelState>()
-  events := owner.openChannel()
+  (sender, receiver) := owner.openChannel()
 
-  try! events.send(42)
+  try! sender.send(42)
   Thread.sleep(Duration.ofMillis(20L))
 
   Assert.equal(drainMainEventLoop(), 0)
   Assert.equal(owner.count(), 1)
   Assert.equal(owner.at(0), 42)
 
-  events.close()
+  receiver.close()
   Assert.equal(owner.count(), 2)
   retired := retire owner
 }
 
 export function testActorOwnedChannelBackpressureClearsOnlyAfterActorPumpRuns(): void {
   owner := Actor<ActorChannelState>()
-  events := owner.openChannel(2, 2, 1)
+  senderActor := Actor<ActorChannelSender>()
+  (sender, receiver) := owner.openChannel(2, 2, 1)
+  senderActor.attachSender(sender)
   blocker := async owner.sleepMillis(40L)
 
-  first := try! events.send(1)
-  second := try! events.send(2)
-  overflow := events.send(3)
+  first := try! sender.send(1)
+  second := try! sender.send(2)
+  overflow := sender.send(3)
 
   Assert.equal(first, Backpressure.None)
   Assert.equal(second, Backpressure.High)
@@ -239,24 +246,27 @@ export function testActorOwnedChannelBackpressureClearsOnlyAfterActorPumpRuns():
   }
 
   try! blocker.get()
-  Assert.equal(owner.count(), 3)
+  Assert.equal(owner.count(), 2)
   Assert.equal(owner.at(0), 1)
-  Assert.equal(owner.at(1), -1)
-  Assert.equal(owner.at(2), 2)
+  Assert.equal(owner.at(1), 2)
+  Assert.equal(senderActor.count(), 1)
+  Assert.equal(senderActor.at(0), -1)
 
-  events.close()
-  Assert.equal(owner.count(), 4)
+  receiver.close()
+  Assert.equal(owner.count(), 3)
+  Assert.equal(senderActor.count(), 2)
   retired := retire owner
+  retiredSender := retire senderActor
 }
 
 export function testActorOwnedChannelPumpYieldsAfterBoundedBatch(): void {
   owner := Actor<ActorChannelState>()
-  events := owner.openChannel(64, 64, 32)
+  (sender, receiver) := owner.openChannel(64, 64, 32)
   blocker := async owner.sleepMillis(40L)
 
   let index = 0
   while index < 40 {
-    try! events.send(index)
+    try! sender.send(index)
     index = index + 1
   }
 
@@ -270,7 +280,7 @@ export function testActorOwnedChannelPumpYieldsAfterBoundedBatch(): void {
   Assert.equal(owner.at(33), 32)
   Assert.equal(owner.at(40), 39)
 
-  events.close()
+  receiver.close()
   Assert.equal(owner.count(), 42)
   retired := retire owner
 }
@@ -301,39 +311,61 @@ export function testIntervalCreatedInsideActorDispatchesOnOwningActor(): void {
 
 export function testChannelDispatchesQueuedMessages(): void {
   let handled: int[] = []
-  let events: Channel<int> = createChannel<int>{
-    handler: collectIntChannelEvents(handled),
+  (sender, receiver) := createChannel<int>{
     capacity: 4,
     highWater: 3,
     lowWater: 1,
     keepsAlive: false,
   }
+  receiver.onMessage(collectIntMessages(handled))
 
-  try! events.send(1)
-  try! events.send(2)
-  try! events.send(3)
+  try! sender.send(1)
+  try! sender.send(2)
+  try! sender.send(3)
 
   runMainEventLoop()
 
-  Assert.equal(handled.length, 4)
+  Assert.equal(handled.length, 3)
   Assert.equal(handled[0], 1)
   Assert.equal(handled[1], 2)
-  Assert.equal(handled[2], -1)
-  Assert.equal(handled[3], 3)
+  Assert.equal(handled[2], 3)
+}
+
+export function testChannelBuffersMessagesUntilReceiverRegisters(): void {
+  let handled: int[] = []
+  (sender, receiver) := createChannel<int>{
+    capacity: 4,
+    highWater: 4,
+    lowWater: 2,
+    keepsAlive: false,
+  }
+
+  try! sender.send(10)
+  try! sender.send(20)
+
+  Assert.equal(drainMainEventLoop(), 0)
+  Assert.equal(handled.length, 0)
+
+  receiver.onMessage(collectIntMessages(handled))
+  runMainEventLoop()
+
+  Assert.equal(handled.length, 2)
+  Assert.equal(handled[0], 10)
+  Assert.equal(handled[1], 20)
 }
 
 export function testChannelReportsBackpressureAndFull(): void {
-  let events: Channel<int> = createChannel<int>{
-    handler: (event: ChannelMessage<int> | ChannelReady<int> | ChannelClosed<int>): void => {},
+  (sender, receiver) := createChannel<int>{
     capacity: 2,
     highWater: 2,
     lowWater: 1,
     keepsAlive: false,
   }
+  receiver.onMessage((value: int): void => {})
 
-  first := try! events.send(1)
-  second := try! events.send(2)
-  overflow := events.send(3)
+  first := try! sender.send(1)
+  second := try! sender.send(2)
+  overflow := sender.send(3)
 
   Assert.equal(first, Backpressure.None)
   Assert.equal(second, Backpressure.High)
@@ -347,18 +379,20 @@ export function testChannelReportsBackpressureAndFull(): void {
 
 export function testChannelCoalescesPendingMessagesByKey(): void {
   let handled: int[] = []
-  let events: Channel<int> = createChannel<int>{
-    handler: collectIntChannelEvents(handled),
+  let ready: int[] = []
+  (sender, receiver) := createChannel<int>{
     capacity: 2,
     highWater: 2,
     lowWater: 1,
     keepsAlive: false,
   }
+  receiver.onMessage(collectIntMessages(handled))
+  sender.onReady((): void => ready.push(-1))
 
-  try! events.send(1, "same")
-  try! events.send(2, "other")
-  overflow := events.send(3)
-  coalesced := try! events.send(4, "same")
+  try! sender.send(1, "same")
+  try! sender.send(2, "other")
+  overflow := sender.send(3)
+  coalesced := try! sender.send(4, "same")
 
   case overflow {
     s: Success -> Assert.fail("expected unkeyed send to fail")
@@ -368,57 +402,115 @@ export function testChannelCoalescesPendingMessagesByKey(): void {
 
   runMainEventLoop()
 
-  Assert.equal(handled.length, 3)
+  Assert.equal(handled.length, 2)
   Assert.equal(handled[0], 4)
-  Assert.equal(handled[1], -1)
-  Assert.equal(handled[2], 2)
+  Assert.equal(handled[1], 2)
+  Assert.equal(ready.length, 1)
+  Assert.equal(ready[0], -1)
 }
 
 export function testChannelReadyFiresOncePerHighWaterRecovery(): void {
   let handled: int[] = []
-  let events: Channel<int> = createChannel<int>{
-    handler: collectIntChannelEvents(handled),
+  let ready: int[] = []
+  (sender, receiver) := createChannel<int>{
     capacity: 4,
     highWater: 3,
     lowWater: 1,
     keepsAlive: false,
   }
+  receiver.onMessage(collectIntMessages(handled))
+  sender.onReady((): void => ready.push(-1))
 
-  try! events.send(1)
-  try! events.send(2)
-  high := try! events.send(3)
+  try! sender.send(1)
+  try! sender.send(2)
+  high := try! sender.send(3)
 
   Assert.equal(high, Backpressure.High)
   runMainEventLoop()
 
-  Assert.equal(handled.length, 4)
+  Assert.equal(handled.length, 3)
   Assert.equal(handled[0], 1)
   Assert.equal(handled[1], 2)
-  Assert.equal(handled[2], -1)
-  Assert.equal(handled[3], 3)
+  Assert.equal(handled[2], 3)
+  Assert.equal(ready.length, 1)
+  Assert.equal(ready[0], -1)
 
-  try! events.send(4)
+  try! sender.send(4)
   runMainEventLoop()
 
-  Assert.equal(handled.length, 5)
-  Assert.equal(handled[4], 4)
+  Assert.equal(handled.length, 4)
+  Assert.equal(handled[3], 4)
+  Assert.equal(ready.length, 1)
 }
 
-export function testChannelCloseDrainsThenDeliversClosed(): void {
+export function testChannelReadyWaitsUntilSenderRegistersHandler(): void {
   let handled: int[] = []
-  let events: Channel<int> = createChannel<int>{
-    handler: collectIntChannelEvents(handled),
+  let ready: int[] = []
+  (sender, receiver) := createChannel<int>{
     capacity: 4,
     highWater: 3,
     lowWater: 1,
     keepsAlive: false,
   }
+  receiver.onMessage(collectIntMessages(handled))
 
-  try! events.send(1)
-  try! events.send(2)
-  events.close()
-  events.close()
-  afterClose := events.send(3)
+  try! sender.send(1)
+  try! sender.send(2)
+  high := try! sender.send(3)
+  Assert.equal(high, Backpressure.High)
+
+  runMainEventLoop()
+  Assert.equal(handled.length, 3)
+  Assert.equal(ready.length, 0)
+
+  sender.onReady((): void => ready.push(-1))
+  Assert.equal(drainMainEventLoop(), 1)
+  Assert.equal(ready.length, 1)
+  Assert.equal(ready[0], -1)
+}
+
+export function testChannelSenderClosedDoesNotWaitForUnregisteredReady(): void {
+  let handled: int[] = []
+  let senderClosed: int[] = []
+  (sender, receiver) := createChannel<int>{
+    capacity: 4,
+    highWater: 3,
+    lowWater: 1,
+    keepsAlive: false,
+  }
+  receiver.onMessage(collectIntMessages(handled))
+
+  try! sender.send(1)
+  try! sender.send(2)
+  high := try! sender.send(3)
+  Assert.equal(high, Backpressure.High)
+  runMainEventLoop()
+
+  sender.close()
+  sender.onClosed((): void => senderClosed.push(-3))
+  drainMainEventLoop()
+  Assert.equal(senderClosed.length, 1)
+  Assert.equal(senderClosed[0], -3)
+}
+
+export function testChannelCloseDrainsThenDeliversClosed(): void {
+  let handled: int[] = []
+  let senderClosed: int[] = []
+  (sender, receiver) := createChannel<int>{
+    capacity: 4,
+    highWater: 3,
+    lowWater: 1,
+    keepsAlive: false,
+  }
+  receiver.onMessage(collectIntMessages(handled))
+  receiver.onClosed((): void => handled.push(-2))
+  sender.onClosed((): void => senderClosed.push(-3))
+
+  try! sender.send(1)
+  try! sender.send(2)
+  receiver.close()
+  sender.close()
+  afterClose := sender.send(3)
 
   case afterClose {
     s: Success -> Assert.fail("expected send after close to fail")
@@ -431,6 +523,31 @@ export function testChannelCloseDrainsThenDeliversClosed(): void {
   Assert.equal(handled[0], 1)
   Assert.equal(handled[1], 2)
   Assert.equal(handled[2], -2)
+  Assert.equal(senderClosed.length, 1)
+  Assert.equal(senderClosed[0], -3)
+}
+
+export function testChannelClosedWaitsUntilEndpointHandlersRegister(): void {
+  let receiverClosed: int[] = []
+  let senderClosed: int[] = []
+  (sender, receiver) := createChannel<int>{
+    capacity: 4,
+    highWater: 4,
+    lowWater: 2,
+    keepsAlive: false,
+  }
+
+  sender.close()
+  Assert.equal(drainMainEventLoop(), 0)
+
+  receiver.onClosed((): void => receiverClosed.push(-2))
+  sender.onClosed((): void => senderClosed.push(-3))
+  runMainEventLoop()
+
+  Assert.equal(receiverClosed.length, 1)
+  Assert.equal(receiverClosed[0], -2)
+  Assert.equal(senderClosed.length, 1)
+  Assert.equal(senderClosed[0], -3)
 }
 
 export function testTimeoutFiresOnce(): void {
