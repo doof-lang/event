@@ -120,6 +120,10 @@ main-loop work becomes ready, so an OS-owned event loop can post back to its
 main thread and call `drainMainEventLoop()`. Ordinary applications should not
 need these functions directly.
 
+The root event mailbox does not own an operating-system thread. Hosts that have
+strict thread-affinity requirements, such as UI runtimes, should arrange for
+`drainMainEventLoop()` to run only on the thread they own.
+
 ### `Timer`
 
 ```doof

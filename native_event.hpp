@@ -2,7 +2,6 @@
 
 #include "doof_runtime.hpp"
 
-#include <condition_variable>
 #include <cstdint>
 #include <chrono>
 #include <deque>
@@ -19,6 +18,20 @@ class NativeChannel;
 class NativeTimer;
 
 namespace detail {
+
+constexpr int32_t kActorChannelBatchSize = 32;
+
+inline doof::detail::CallbackDomain* currentOrApplicationDomain() {
+    auto* owner = doof::current_actor_domain();
+    if (owner) {
+        return owner;
+    }
+    return &doof::detail::ApplicationDomain::shared();
+}
+
+inline bool isApplicationDomain(doof::detail::CallbackDomain* owner) {
+    return doof::detail::ApplicationDomain::is_application_domain(owner);
+}
 
 enum class TimerKind {
     Timeout,
@@ -58,6 +71,8 @@ public:
 
     void finishTimerTick(NativeTimer& timer);
 
+    void drainChannel(const std::shared_ptr<NativeChannel>& channel);
+
     int32_t drainReady();
 
     bool waitAndDispatchOne();
@@ -68,15 +83,14 @@ private:
     MainEventDispatcher() = default;
 
     void removeKeepAliveSourceLocked(bool keepsAlive);
-    bool takeReadyTaskLocked(doof::callback<void()>& task);
-    void notifyReady();
+    bool scheduleChannelLocked(const std::shared_ptr<NativeChannel>& channel);
+    void scheduleOwnerChannel(const std::shared_ptr<NativeChannel>& channel);
+    bool takeChannelTaskLocked(
+        const std::shared_ptr<NativeChannel>& channel,
+        doof::callback<void()>& task
+    );
 
     std::mutex mutex_;
-    std::condition_variable ready_;
-    std::deque<std::shared_ptr<NativeChannel>> readyChannels_;
-    std::deque<doof::callback<void()>> readyTasks_;
-    int64_t keepAliveCount_ = 0;
-    std::function<void()> wakeHandler_;
 };
 
 }  // namespace detail
@@ -143,11 +157,14 @@ private:
     ) : capacity_(capacity),
         highWater_(highWater),
         lowWater_(lowWater),
+        owner_(detail::currentOrApplicationDomain()),
         keepsAlive_(keepsAlive),
         readyHandler_(std::move(readyHandler)),
         closedHandler_(std::move(closedHandler)),
         sendsReadyAndClosed_(true) {
-        detail::MainEventDispatcher::shared().addKeepAliveSource(keepsAlive_);
+        detail::MainEventDispatcher::shared().addKeepAliveSource(
+            detail::isApplicationDomain(owner_) && keepsAlive_
+        );
     }
 
     enum class TaskKind {
@@ -166,6 +183,7 @@ private:
     int32_t capacity_;
     int32_t highWater_ = 0;
     int32_t lowWater_ = 0;
+    doof::detail::CallbackDomain* owner_ = nullptr;
     bool keepsAlive_;
     bool closed_ = false;
     bool scheduled_ = false;
@@ -227,6 +245,7 @@ private:
     ) : periodNanos_(periodNanos),
         kind_(kind),
         keepsAlive_(keepsAlive),
+        owner_(detail::currentOrApplicationDomain()),
         handler_(std::move(handler)) {
     }
 
@@ -235,20 +254,40 @@ private:
     bool keepsAlive_;
     bool countedKeepAlive_ = false;
     detail::TimerState state_ = detail::TimerState::Scheduled;
+    doof::detail::CallbackDomain* owner_;
     doof::callback<void()> handler_;
 };
 
 inline void detail::MainEventDispatcher::addKeepAliveSource(bool keepsAlive) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (keepsAlive) {
-        ++keepAliveCount_;
-    }
+    doof::detail::ApplicationDomain::shared().add_keep_alive_source(keepsAlive);
 }
 
 inline void detail::MainEventDispatcher::removeKeepAliveSourceLocked(bool keepsAlive) {
-    if (keepsAlive && keepAliveCount_ > 0) {
-        --keepAliveCount_;
+    doof::detail::ApplicationDomain::shared().remove_keep_alive_source(keepsAlive);
+}
+
+inline bool detail::MainEventDispatcher::scheduleChannelLocked(
+    const std::shared_ptr<NativeChannel>& channel
+) {
+    if (channel->scheduled_) {
+        return false;
     }
+
+    channel->scheduled_ = true;
+    return true;
+}
+
+inline void detail::MainEventDispatcher::scheduleOwnerChannel(
+    const std::shared_ptr<NativeChannel>& channel
+) {
+    auto owner = channel->owner_;
+    if (!owner) {
+        owner = &doof::detail::ApplicationDomain::shared();
+    }
+
+    owner->enqueue_callback([channel] {
+        detail::MainEventDispatcher::shared().drainChannel(channel);
+    });
 }
 
 inline int32_t detail::MainEventDispatcher::trySendMessage(
@@ -257,7 +296,7 @@ inline int32_t detail::MainEventDispatcher::trySendMessage(
     bool hasKey,
     const std::string& key
 ) {
-    bool shouldNotify = false;
+    bool shouldSchedule = false;
     int32_t code = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -299,22 +338,21 @@ inline int32_t detail::MainEventDispatcher::trySendMessage(
             code = 1;  // Accepted, high backpressure
         }
 
-        if (!channel->scheduled_) {
-            channel->scheduled_ = true;
-            readyChannels_.push_back(channel);
-            shouldNotify = true;
+        if (scheduleChannelLocked(channel)) {
+            shouldSchedule = true;
         }
     }
 
-    if (shouldNotify) {
-        notifyReady();
+    if (shouldSchedule) {
+        scheduleOwnerChannel(channel);
     }
     return code;
 }
 
 inline bool detail::MainEventDispatcher::tryClose(NativeChannel& channel) {
     bool removedKeepAlive = false;
-    bool shouldNotify = false;
+    bool shouldSchedule = false;
+    std::shared_ptr<NativeChannel> scheduledChannel;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (channel.closed_) {
@@ -322,7 +360,7 @@ inline bool detail::MainEventDispatcher::tryClose(NativeChannel& channel) {
         }
 
         channel.closed_ = true;
-        removedKeepAlive = channel.keepsAlive_;
+        removedKeepAlive = detail::isApplicationDomain(channel.owner_) && channel.keepsAlive_;
         removeKeepAliveSourceLocked(removedKeepAlive);
 
         if (channel.sendsReadyAndClosed_ && !channel.closedQueued_) {
@@ -335,17 +373,16 @@ inline bool detail::MainEventDispatcher::tryClose(NativeChannel& channel) {
                     std::string(),
                     std::move(channel.closedHandler_),
                 });
-                if (!channel.scheduled_) {
-                    channel.scheduled_ = true;
-                    readyChannels_.push_back(std::move(self));
-                    shouldNotify = true;
+                if (scheduleChannelLocked(self)) {
+                    scheduledChannel = std::move(self);
+                    shouldSchedule = true;
                 }
             }
         }
     }
 
-    if (removedKeepAlive || shouldNotify) {
-        notifyReady();
+    if (shouldSchedule) {
+        scheduleOwnerChannel(scheduledChannel);
     }
     return true;
 }
@@ -358,7 +395,7 @@ inline void detail::MainEventDispatcher::startTimer(const std::shared_ptr<Native
         }
         if (timer->keepsAlive_ && !timer->countedKeepAlive_) {
             timer->countedKeepAlive_ = true;
-            ++keepAliveCount_;
+            doof::detail::ApplicationDomain::shared().add_keep_alive_source(true);
         }
     }
 
@@ -372,7 +409,6 @@ inline void detail::MainEventDispatcher::startTimer(const std::shared_ptr<Native
 }
 
 inline bool detail::MainEventDispatcher::cancelTimer(NativeTimer& timer) {
-    bool removedKeepAlive = false;
     bool canceled = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -389,19 +425,15 @@ inline bool detail::MainEventDispatcher::cancelTimer(NativeTimer& timer) {
 
         if (canceled && timer.countedKeepAlive_) {
             timer.countedKeepAlive_ = false;
-            removedKeepAlive = true;
-            removeKeepAliveSourceLocked(true);
+            doof::detail::ApplicationDomain::shared().remove_keep_alive_source(true);
         }
     }
 
-    if (removedKeepAlive) {
-        notifyReady();
-    }
     return canceled;
 }
 
 inline void detail::MainEventDispatcher::commitTimer(const std::shared_ptr<NativeTimer>& timer) {
-    bool shouldNotify = false;
+    doof::detail::CallbackDomain* owner = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (timer->state_ != TimerState::Scheduled) {
@@ -409,28 +441,30 @@ inline void detail::MainEventDispatcher::commitTimer(const std::shared_ptr<Nativ
         }
 
         timer->state_ = TimerState::Dispatching;
-        if (timer->kind_ == TimerKind::Timeout && timer->countedKeepAlive_) {
-            timer->countedKeepAlive_ = false;
-            removeKeepAliveSourceLocked(true);
-        }
-
-        readyTasks_.push_back([timer] {
-            doof::detail::call_callback_unchecked(timer->handler_);
-            detail::MainEventDispatcher::shared().finishTimerTick(*timer);
-        });
-        shouldNotify = true;
+        owner = timer->owner_ ? timer->owner_ : &doof::detail::ApplicationDomain::shared();
     }
 
-    if (shouldNotify) {
-        notifyReady();
-    }
+    owner->enqueue_callback([timer] {
+        doof::detail::call_callback_unchecked(timer->handler_);
+        detail::MainEventDispatcher::shared().finishTimerTick(*timer);
+    });
 }
 
 inline void detail::MainEventDispatcher::finishTimerTick(NativeTimer& timer) {
     if (timer.kind_ == TimerKind::Timeout) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (timer.state_ == TimerState::Dispatching) {
-            timer.state_ = TimerState::Completed;
+        bool removedKeepAlive = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (timer.state_ == TimerState::Dispatching) {
+                timer.state_ = TimerState::Completed;
+            }
+            if (timer.countedKeepAlive_) {
+                timer.countedKeepAlive_ = false;
+                removedKeepAlive = true;
+            }
+        }
+        if (removedKeepAlive) {
+            doof::detail::ApplicationDomain::shared().remove_keep_alive_source(true);
         }
         return;
     }
@@ -449,97 +483,83 @@ inline void detail::MainEventDispatcher::finishTimerTick(NativeTimer& timer) {
     }
 }
 
-inline bool detail::MainEventDispatcher::takeReadyTaskLocked(doof::callback<void()>& task) {
-    if (!readyTasks_.empty()) {
-        task = std::move(readyTasks_.front());
-        readyTasks_.pop_front();
-        return true;
+inline bool detail::MainEventDispatcher::takeChannelTaskLocked(
+    const std::shared_ptr<NativeChannel>& channel,
+    doof::callback<void()>& task
+) {
+    if (channel->tasks_.empty()) {
+        return false;
     }
 
-    if (!readyChannels_.empty()) {
-        auto channel = std::move(readyChannels_.front());
-        readyChannels_.pop_front();
-        channel->scheduled_ = false;
+    auto queued = std::move(channel->tasks_.front());
+    channel->tasks_.pop_front();
+    task = std::move(queued.task);
 
-        auto queued = std::move(channel->tasks_.front());
-        channel->tasks_.pop_front();
-        task = std::move(queued.task);
-
-        if (queued.kind == NativeChannel::TaskKind::Message) {
-            --channel->messageCount_;
-            if (
-                channel->waitingForReady_ &&
-                channel->messageCount_ <= channel->lowWater_
-            ) {
-                channel->waitingForReady_ = false;
-                channel->tasks_.push_front(NativeChannel::QueuedTask {
-                    NativeChannel::TaskKind::Ready,
-                    false,
-                    std::string(),
-                    channel->readyHandler_,
-                });
-            }
+    if (queued.kind == NativeChannel::TaskKind::Message) {
+        --channel->messageCount_;
+        if (
+            channel->waitingForReady_ &&
+            channel->messageCount_ <= channel->lowWater_
+        ) {
+            channel->waitingForReady_ = false;
+            channel->tasks_.push_front(NativeChannel::QueuedTask {
+                NativeChannel::TaskKind::Ready,
+                false,
+                std::string(),
+                channel->readyHandler_,
+            });
         }
-
-        if (!channel->tasks_.empty()) {
-            channel->scheduled_ = true;
-            readyChannels_.push_back(std::move(channel));
-        }
-        return true;
     }
 
-    return false;
+    return true;
 }
 
-inline int32_t detail::MainEventDispatcher::drainReady() {
+inline void detail::MainEventDispatcher::drainChannel(
+    const std::shared_ptr<NativeChannel>& channel
+) {
+    const int32_t batchSize = detail::isApplicationDomain(channel->owner_)
+        ? 1
+        : kActorChannelBatchSize;
     int32_t dispatched = 0;
-    while (true) {
+    while (dispatched < batchSize) {
         doof::callback<void()> task;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!takeReadyTaskLocked(task)) {
-                return dispatched;
+            if (!takeChannelTaskLocked(channel, task)) {
+                channel->scheduled_ = false;
+                return;
             }
         }
 
         doof::detail::call_callback_unchecked(task);
         ++dispatched;
     }
-}
 
-inline bool detail::MainEventDispatcher::waitAndDispatchOne() {
-    doof::callback<void()> task;
+    bool shouldContinue = false;
     {
-        std::unique_lock<std::mutex> lock(mutex_);
-        ready_.wait(lock, [this] {
-            return !readyTasks_.empty() || !readyChannels_.empty() || keepAliveCount_ == 0;
-        });
-
-        if (!takeReadyTaskLocked(task)) {
-            return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (channel->tasks_.empty()) {
+            channel->scheduled_ = false;
+        } else {
+            shouldContinue = true;
         }
     }
 
-    doof::detail::call_callback_unchecked(task);
-    return true;
+    if (shouldContinue) {
+        scheduleOwnerChannel(channel);
+    }
+}
+
+inline int32_t detail::MainEventDispatcher::drainReady() {
+    return doof::detail::ApplicationDomain::shared().drain_ready();
+}
+
+inline bool detail::MainEventDispatcher::waitAndDispatchOne() {
+    return doof::detail::ApplicationDomain::shared().wait_and_dispatch_one();
 }
 
 inline void detail::MainEventDispatcher::setWakeHandler(std::function<void()> handler) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    wakeHandler_ = std::move(handler);
-}
-
-inline void detail::MainEventDispatcher::notifyReady() {
-    std::function<void()> wakeHandler;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        wakeHandler = wakeHandler_;
-    }
-
-    ready_.notify_all();
-    if (wakeHandler) {
-        wakeHandler();
-    }
+    doof::detail::ApplicationDomain::shared().set_wake_handler(std::move(handler));
 }
 
 inline void runMainEventLoop() {
@@ -557,7 +577,7 @@ inline void setMainEventWakeHandler(std::function<void()> handler) {
 
 inline void setMainEventWakeCallback(doof::callback<void()> handler) {
     detail::MainEventDispatcher::shared().setWakeHandler([handler]() mutable {
-        handler.dispatch();
+        doof::detail::call_callback_unchecked(handler);
     });
 }
 

@@ -1,5 +1,5 @@
 import { Assert } from "std/assert"
-import { Duration } from "std/time"
+import { Duration, Thread } from "std/time"
 
 import {
   Backpressure,
@@ -54,6 +54,10 @@ class ActorChannelState {
     this.values.push(value)
   }
 
+  sleepMillis(millis: long): void {
+    Thread.sleep(Duration.ofMillis(millis))
+  }
+
   startTimeout(): void {
     setTimeout{
       delay: Duration.ZERO,
@@ -81,6 +85,10 @@ class ActorChannelState {
 class ActorChannelSender {
   deliver(events: Channel<int>, value: int): void {
     try! events.send(value)
+  }
+
+  dispatch(callback: (): void): void {
+    callback.dispatch()
   }
 }
 
@@ -115,13 +123,13 @@ export function testActorOwnedChannelDispatchesMessageOnOwningActor(): void {
   events := owner.openChannel()
 
   try! events.send(42)
-  Assert.equal(drainMainEventLoop(), 1)
+  Assert.equal(drainMainEventLoop(), 0)
 
   Assert.equal(owner.count(), 1)
   Assert.equal(owner.at(0), 42)
 
   events.close()
-  Assert.equal(drainMainEventLoop(), 1)
+  Assert.equal(owner.count(), 2)
   retired := retire owner
 }
 
@@ -131,7 +139,7 @@ export function testActorOwnedChannelPreservesMailboxOrdering(): void {
 
   first := async owner.mark(1)
   try! events.send(2)
-  Assert.equal(drainMainEventLoop(), 1)
+  Assert.equal(drainMainEventLoop(), 0)
   last := async owner.mark(3)
 
   try! first.get()
@@ -143,7 +151,7 @@ export function testActorOwnedChannelPreservesMailboxOrdering(): void {
   Assert.equal(owner.at(2), 3)
 
   events.close()
-  Assert.equal(drainMainEventLoop(), 1)
+  Assert.equal(owner.count(), 4)
   retired := retire owner
 }
 
@@ -156,7 +164,6 @@ export function testActorOwnedChannelDispatchesReadyAndClosedOnOwningActor(): vo
   Assert.equal(high, Backpressure.High)
   events.close()
 
-  Assert.equal(drainMainEventLoop(), 4)
   Assert.equal(owner.count(), 4)
   Assert.equal(owner.at(0), 10)
   Assert.equal(owner.at(1), 20)
@@ -172,15 +179,100 @@ export function testActorOwnedChannelAcceptsSendFromAnotherActor(): void {
   events := owner.openChannel()
 
   sender.deliver(events, 77)
-  Assert.equal(drainMainEventLoop(), 1)
+  Assert.equal(drainMainEventLoop(), 0)
 
   Assert.equal(owner.count(), 1)
   Assert.equal(owner.at(0), 77)
 
   events.close()
-  Assert.equal(drainMainEventLoop(), 1)
+  Assert.equal(owner.count(), 2)
   retiredSender := retire sender
   retiredOwner := retire owner
+}
+
+export function testRootCallbackDispatchedFromActorRunsOnMainDrain(): void {
+  sender := Actor<ActorChannelSender>()
+  let value = 0
+  callback := (): void => {
+    value = 42
+  }
+
+  sender.dispatch(callback)
+
+  Assert.equal(value, 0)
+  Assert.equal(drainMainEventLoop(), 1)
+  Assert.equal(value, 42)
+
+  retired := retire sender
+}
+
+export function testActorOwnedChannelDoesNotNeedMainDrainWhileMainSleeps(): void {
+  owner := Actor<ActorChannelState>()
+  events := owner.openChannel()
+
+  try! events.send(42)
+  Thread.sleep(Duration.ofMillis(20L))
+
+  Assert.equal(drainMainEventLoop(), 0)
+  Assert.equal(owner.count(), 1)
+  Assert.equal(owner.at(0), 42)
+
+  events.close()
+  Assert.equal(owner.count(), 2)
+  retired := retire owner
+}
+
+export function testActorOwnedChannelBackpressureClearsOnlyAfterActorPumpRuns(): void {
+  owner := Actor<ActorChannelState>()
+  events := owner.openChannel(2, 2, 1)
+  blocker := async owner.sleepMillis(40L)
+
+  first := try! events.send(1)
+  second := try! events.send(2)
+  overflow := events.send(3)
+
+  Assert.equal(first, Backpressure.None)
+  Assert.equal(second, Backpressure.High)
+  case overflow {
+    s: Success -> Assert.fail("expected third send to fail")
+    f: Failure -> Assert.equal(f.error, SendError.Full)
+  }
+
+  try! blocker.get()
+  Assert.equal(owner.count(), 3)
+  Assert.equal(owner.at(0), 1)
+  Assert.equal(owner.at(1), -1)
+  Assert.equal(owner.at(2), 2)
+
+  events.close()
+  Assert.equal(owner.count(), 4)
+  retired := retire owner
+}
+
+export function testActorOwnedChannelPumpYieldsAfterBoundedBatch(): void {
+  owner := Actor<ActorChannelState>()
+  events := owner.openChannel(64, 64, 32)
+  blocker := async owner.sleepMillis(40L)
+
+  let index = 0
+  while index < 40 {
+    try! events.send(index)
+    index = index + 1
+  }
+
+  marker := async owner.mark(999)
+  try! blocker.get()
+  try! marker.get()
+
+  Assert.equal(owner.count(), 41)
+  Assert.equal(owner.at(31), 31)
+  Assert.equal(owner.at(32), 999)
+  Assert.equal(owner.at(33), 32)
+  Assert.equal(owner.at(40), 39)
+
+  events.close()
+  Assert.equal(owner.count(), 42)
+  retired := retire owner
 }
 
 export function testTimeoutCreatedInsideActorDispatchesOnOwningActor(): void {
