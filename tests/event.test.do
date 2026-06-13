@@ -35,8 +35,12 @@ class ActorChannelState {
       lowWater,
       keepsAlive: false,
     }
-    receiver.onMessage((value: int): void => this.values.push(value))
-    receiver.onClosed((): void => this.values.push(-2))
+    receiver.onMessage() {
+       this.values.push(it)
+    }
+    receiver.onClosed() {
+      this.values.push(-2)
+    }
     return (sender, receiver)
   }
 
@@ -81,8 +85,8 @@ class ActorChannelSender {
   values: int[] = []
 
   attachSender(sender: ChannelSender<int>): void {
-    sender.onReady((): void => this.values.push(-1))
-    sender.onClosed((): void => this.values.push(-2))
+    sender.onReady() { this.values.push(-1) }
+    sender.onClosed() { this.values.push(-2) }
   }
 
   deliver(sender: ChannelSender<int>, value: int): void {
@@ -419,7 +423,7 @@ export function testChannelReadyFiresOncePerHighWaterRecovery(): void {
     keepsAlive: false,
   }
   receiver.onMessage(collectIntMessages(handled))
-  sender.onReady((): void => ready.push(-1))
+  sender.onReady() { ready.push(-1) }
 
   try! sender.send(1)
   try! sender.send(2)

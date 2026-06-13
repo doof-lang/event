@@ -78,7 +78,7 @@ export class ChannelSender<T> {
 export class ChannelReceiver<T> {
   private readonly native: NativeChannel
 
-  onMessage(handler: (value: T): void): void {
+  onMessage(handler: (it: T): void): void {
     _registerChannelReceiverMessage(this.native, handler)
   }
 
