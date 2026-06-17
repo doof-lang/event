@@ -7,6 +7,7 @@
 #include <chrono>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -57,7 +58,7 @@ public:
 
     int32_t trySendMessage(
         const std::shared_ptr<NativeChannel>& channel,
-        doof::callback<void()> task,
+        std::function<void()> task,
         bool hasKey,
         const std::string& key
     );
@@ -89,11 +90,11 @@ public:
     void scheduleReceiverChannel(const std::shared_ptr<NativeChannel>& channel);
     bool takeSenderTaskLocked(
         const std::shared_ptr<NativeChannel>& channel,
-        doof::callback<void()>& task
+        std::function<void()>& task
     );
     bool takeReceiverTaskLocked(
         const std::shared_ptr<NativeChannel>& channel,
-        doof::callback<void()>& task,
+        std::function<void()>& task,
         bool& shouldScheduleSender
     );
 
@@ -141,9 +142,9 @@ public:
     int32_t trySendMessage(T value, bool hasKey, const std::string& key) {
         return detail::MainEventDispatcher::shared().trySendMessage(
             shared_from_this(),
-            doof::callback<void()>([self = shared_from_this(), value = std::move(value)]() mutable {
+            [self = shared_from_this(), value = std::move(value)]() mutable {
                 self->deliverMessage<T>(std::move(value));
-            }),
+            },
             hasKey,
             key
         );
@@ -155,6 +156,28 @@ public:
         {
             std::lock_guard<std::mutex> lock(detail::MainEventDispatcher::shared().mutex_);
             claimReceiverOwnerLocked();
+            if (receiverMessageRegistered_) {
+                doof::panic("Channel receiver message handler is already registered");
+            }
+            receiverMessageHandler_ = std::function<void(T)>([handler = std::move(handler)](T value) mutable {
+                handler.call(std::move(value));
+            });
+            receiverMessageRegistered_ = true;
+            if (detail::MainEventDispatcher::shared().scheduleReceiverLocked(shared_from_this())) {
+                shouldSchedule = true;
+            }
+        }
+        if (shouldSchedule) {
+            detail::MainEventDispatcher::shared().scheduleReceiverChannel(shared_from_this());
+        }
+    }
+
+    template <typename T>
+    void registerNativeReceiverMessage(std::function<void(T)> handler) {
+        bool shouldSchedule = false;
+        {
+            std::lock_guard<std::mutex> lock(detail::MainEventDispatcher::shared().mutex_);
+            setReceiverDispatchLocked(HandlerDispatch::Native);
             if (receiverMessageRegistered_) {
                 doof::panic("Channel receiver message handler is already registered");
             }
@@ -185,8 +208,56 @@ public:
             if (receiverClosedRegistered_) {
                 doof::panic("Channel receiver closed handler is already registered");
             }
+            receiverClosedHandler_ = [handler = std::move(handler)]() mutable {
+                handler.call();
+            };
+            receiverClosedRegistered_ = true;
+            if (detail::MainEventDispatcher::shared().scheduleReceiverLocked(shared_from_this())) {
+                shouldSchedule = true;
+            }
+        }
+        if (shouldSchedule) {
+            detail::MainEventDispatcher::shared().scheduleReceiverChannel(shared_from_this());
+        }
+    }
+
+    void registerNativeSenderReady(std::function<void()> handler) {
+        registerNativeSenderHandler(std::move(handler), SenderHandlerKind::Ready);
+    }
+
+    void registerNativeSenderClosed(std::function<void()> handler) {
+        registerNativeSenderHandler(std::move(handler), SenderHandlerKind::Closed);
+    }
+
+    void registerNativeReceiverClosed(std::function<void()> handler) {
+        bool shouldSchedule = false;
+        {
+            std::lock_guard<std::mutex> lock(detail::MainEventDispatcher::shared().mutex_);
+            setReceiverDispatchLocked(HandlerDispatch::Native);
+            if (receiverClosedRegistered_) {
+                doof::panic("Channel receiver closed handler is already registered");
+            }
             receiverClosedHandler_ = std::move(handler);
             receiverClosedRegistered_ = true;
+            if (detail::MainEventDispatcher::shared().scheduleReceiverLocked(shared_from_this())) {
+                shouldSchedule = true;
+            }
+        }
+        if (shouldSchedule) {
+            detail::MainEventDispatcher::shared().scheduleReceiverChannel(shared_from_this());
+        }
+    }
+
+    void pauseReceiver() {
+        std::lock_guard<std::mutex> lock(detail::MainEventDispatcher::shared().mutex_);
+        receiverPaused_ = true;
+    }
+
+    void resumeReceiver() {
+        bool shouldSchedule = false;
+        {
+            std::lock_guard<std::mutex> lock(detail::MainEventDispatcher::shared().mutex_);
+            receiverPaused_ = false;
             if (detail::MainEventDispatcher::shared().scheduleReceiverLocked(shared_from_this())) {
                 shouldSchedule = true;
             }
@@ -225,12 +296,12 @@ private:
         TaskKind kind;
         bool hasKey;
         std::string key;
-        doof::callback<void()> task;
+        std::function<void()> task;
     };
 
     struct SenderTask {
         TaskKind kind;
-        doof::callback<void()> task;
+        std::function<void()> task;
     };
 
     enum class SenderHandlerKind {
@@ -238,11 +309,32 @@ private:
         Closed,
     };
 
+    enum class HandlerDispatch {
+        Unset,
+        Doof,
+        Native,
+    };
+
+    void setSenderDispatchLocked(HandlerDispatch dispatch) {
+        if (senderDispatch_ != HandlerDispatch::Unset && senderDispatch_ != dispatch) {
+            doof::panic("Channel sender handlers must use the same dispatch mode");
+        }
+        senderDispatch_ = dispatch;
+    }
+
+    void setReceiverDispatchLocked(HandlerDispatch dispatch) {
+        if (receiverDispatch_ != HandlerDispatch::Unset && receiverDispatch_ != dispatch) {
+            doof::panic("Channel receiver handlers must use the same dispatch mode");
+        }
+        receiverDispatch_ = dispatch;
+    }
+
     void claimSenderOwnerLocked() {
         auto* owner = detail::currentOrApplicationDomain();
         if (senderOwnerSet_ && senderOwner_ != owner) {
             doof::panic("Channel sender handlers must be registered from the same actor domain");
         }
+        setSenderDispatchLocked(HandlerDispatch::Doof);
         senderOwner_ = owner;
         senderOwnerSet_ = true;
     }
@@ -252,15 +344,34 @@ private:
         if (receiverOwnerSet_ && receiverOwner_ != owner) {
             doof::panic("Channel receiver handlers must be registered from the same actor domain");
         }
+        setReceiverDispatchLocked(HandlerDispatch::Doof);
         receiverOwner_ = owner;
         receiverOwnerSet_ = true;
     }
 
     void registerSenderHandler(doof::callback<void()> handler, SenderHandlerKind kind) {
+        registerNativeSenderHandler(
+            [handler = std::move(handler)]() mutable {
+                handler.call();
+            },
+            kind,
+            true
+        );
+    }
+
+    void registerNativeSenderHandler(
+        std::function<void()> handler,
+        SenderHandlerKind kind,
+        bool claimOwner = false
+    ) {
         bool shouldSchedule = false;
         {
             std::lock_guard<std::mutex> lock(detail::MainEventDispatcher::shared().mutex_);
-            claimSenderOwnerLocked();
+            if (claimOwner) {
+                claimSenderOwnerLocked();
+            } else {
+                setSenderDispatchLocked(HandlerDispatch::Native);
+            }
             if (kind == SenderHandlerKind::Ready) {
                 if (senderReadyRegistered_) {
                     doof::panic("Channel sender ready handler is already registered");
@@ -285,11 +396,11 @@ private:
 
     template <typename T>
     void deliverMessage(T value) {
-        auto* handler = std::any_cast<doof::callback<void(T)>>(&receiverMessageHandler_);
+        auto* handler = std::any_cast<std::function<void(T)>>(&receiverMessageHandler_);
         if (handler == nullptr) {
             doof::panic("Channel receiver message handler is not registered");
         }
-        handler->call(std::move(value));
+        (*handler)(std::move(value));
     }
 
     int32_t capacity_;
@@ -303,18 +414,21 @@ private:
     bool receiverScheduled_ = false;
     bool senderOwnerSet_ = false;
     bool receiverOwnerSet_ = false;
+    HandlerDispatch senderDispatch_ = HandlerDispatch::Unset;
+    HandlerDispatch receiverDispatch_ = HandlerDispatch::Unset;
     bool senderReadyRegistered_ = false;
     bool senderClosedRegistered_ = false;
     bool receiverMessageRegistered_ = false;
     bool receiverClosedRegistered_ = false;
+    bool receiverPaused_ = false;
     bool waitingForReady_ = false;
     bool receiverClosedQueued_ = false;
     bool senderClosedQueued_ = false;
     int32_t messageCount_ = 0;
     std::any receiverMessageHandler_;
-    doof::callback<void()> senderReadyHandler_;
-    doof::callback<void()> senderClosedHandler_;
-    doof::callback<void()> receiverClosedHandler_;
+    std::function<void()> senderReadyHandler_;
+    std::function<void()> senderClosedHandler_;
+    std::function<void()> receiverClosedHandler_;
     std::deque<ReceiverTask> receiverTasks_;
     std::deque<SenderTask> senderTasks_;
 };
@@ -413,7 +527,7 @@ inline bool detail::MainEventDispatcher::scheduleSenderLocked(
 inline bool detail::MainEventDispatcher::scheduleReceiverLocked(
     const std::shared_ptr<NativeChannel>& channel
 ) {
-    if (channel->receiverScheduled_ || channel->receiverTasks_.empty()) {
+    if (channel->receiverPaused_ || channel->receiverScheduled_ || channel->receiverTasks_.empty()) {
         return false;
     }
 
@@ -432,6 +546,11 @@ inline bool detail::MainEventDispatcher::scheduleReceiverLocked(
 inline void detail::MainEventDispatcher::scheduleSenderChannel(
     const std::shared_ptr<NativeChannel>& channel
 ) {
+    if (channel->senderDispatch_ == NativeChannel::HandlerDispatch::Native) {
+        drainSender(channel);
+        return;
+    }
+
     auto owner = channel->senderOwner_;
     if (!owner) {
         owner = &doof::detail::ApplicationDomain::shared();
@@ -445,6 +564,11 @@ inline void detail::MainEventDispatcher::scheduleSenderChannel(
 inline void detail::MainEventDispatcher::scheduleReceiverChannel(
     const std::shared_ptr<NativeChannel>& channel
 ) {
+    if (channel->receiverDispatch_ == NativeChannel::HandlerDispatch::Native) {
+        drainReceiver(channel);
+        return;
+    }
+
     auto owner = channel->receiverOwner_;
     if (!owner) {
         owner = &doof::detail::ApplicationDomain::shared();
@@ -457,7 +581,7 @@ inline void detail::MainEventDispatcher::scheduleReceiverChannel(
 
 inline int32_t detail::MainEventDispatcher::trySendMessage(
     const std::shared_ptr<NativeChannel>& channel,
-    doof::callback<void()> task,
+    std::function<void()> task,
     bool hasKey,
     const std::string& key
 ) {
@@ -536,9 +660,9 @@ inline bool detail::MainEventDispatcher::tryClose(NativeChannel& channel) {
                 NativeChannel::TaskKind::Closed,
                 false,
                 std::string(),
-                doof::callback<void()>([self] {
-                    self->receiverClosedHandler_.call();
-                }),
+                [self] {
+                    self->receiverClosedHandler_();
+                },
             });
             if (scheduleReceiverLocked(self)) {
                 shouldScheduleReceiver = true;
@@ -548,9 +672,9 @@ inline bool detail::MainEventDispatcher::tryClose(NativeChannel& channel) {
             channel.senderClosedQueued_ = true;
             channel.senderTasks_.push_back(NativeChannel::SenderTask {
                 NativeChannel::TaskKind::Closed,
-                doof::callback<void()>([self] {
-                    self->senderClosedHandler_.call();
-                }),
+                [self] {
+                    self->senderClosedHandler_();
+                },
             });
             if (scheduleSenderLocked(self)) {
                 shouldScheduleSender = true;
@@ -665,7 +789,7 @@ inline void detail::MainEventDispatcher::finishTimerTick(NativeTimer& timer) {
 
 inline bool detail::MainEventDispatcher::takeSenderTaskLocked(
     const std::shared_ptr<NativeChannel>& channel,
-    doof::callback<void()>& task
+    std::function<void()>& task
 ) {
     if (channel->senderTasks_.empty()) {
         return false;
@@ -688,10 +812,13 @@ inline bool detail::MainEventDispatcher::takeSenderTaskLocked(
 
 inline bool detail::MainEventDispatcher::takeReceiverTaskLocked(
     const std::shared_ptr<NativeChannel>& channel,
-    doof::callback<void()>& task,
+    std::function<void()>& task,
     bool& shouldScheduleSender
 ) {
     if (channel->receiverTasks_.empty()) {
+        return false;
+    }
+    if (channel->receiverPaused_) {
         return false;
     }
 
@@ -716,9 +843,9 @@ inline bool detail::MainEventDispatcher::takeReceiverTaskLocked(
             channel->waitingForReady_ = false;
             channel->senderTasks_.push_back(NativeChannel::SenderTask {
                 NativeChannel::TaskKind::Ready,
-                doof::callback<void()>([channel] {
-                    channel->senderReadyHandler_.call();
-                }),
+                [channel] {
+                    channel->senderReadyHandler_();
+                },
             });
             if (scheduleSenderLocked(channel)) {
                 shouldScheduleSender = true;
@@ -738,12 +865,14 @@ inline void detail::MainEventDispatcher::drainChannel(
 inline void detail::MainEventDispatcher::drainSender(
     const std::shared_ptr<NativeChannel>& channel
 ) {
-    const int32_t batchSize = detail::isApplicationDomain(channel->senderOwner_)
+    const int32_t batchSize = channel->senderDispatch_ == NativeChannel::HandlerDispatch::Native
+        ? std::numeric_limits<int32_t>::max()
+        : detail::isApplicationDomain(channel->senderOwner_)
         ? 1
         : kActorChannelBatchSize;
     int32_t dispatched = 0;
     while (dispatched < batchSize) {
-        doof::callback<void()> task;
+        std::function<void()> task;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!takeSenderTaskLocked(channel, task)) {
@@ -752,7 +881,7 @@ inline void detail::MainEventDispatcher::drainSender(
             }
         }
 
-        doof::detail::call_callback_unchecked(task);
+        task();
         ++dispatched;
     }
 
@@ -774,12 +903,14 @@ inline void detail::MainEventDispatcher::drainSender(
 inline void detail::MainEventDispatcher::drainReceiver(
     const std::shared_ptr<NativeChannel>& channel
 ) {
-    const int32_t batchSize = detail::isApplicationDomain(channel->receiverOwner_)
+    const int32_t batchSize = channel->receiverDispatch_ == NativeChannel::HandlerDispatch::Native
+        ? std::numeric_limits<int32_t>::max()
+        : detail::isApplicationDomain(channel->receiverOwner_)
         ? 1
         : kActorChannelBatchSize;
     int32_t dispatched = 0;
     while (dispatched < batchSize) {
-        doof::callback<void()> task;
+        std::function<void()> task;
         bool shouldScheduleSender = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -792,7 +923,7 @@ inline void detail::MainEventDispatcher::drainReceiver(
         if (shouldScheduleSender) {
             scheduleSenderChannel(channel);
         }
-        doof::detail::call_callback_unchecked(task);
+        task();
         ++dispatched;
     }
 
