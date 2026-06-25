@@ -17,6 +17,13 @@ hold only the sender for inbound requests, an actor can hold only the receiver
 for actor-affine callbacks, and a producer can react to `onReady` without being
 able to consume messages.
 
+## Documentation
+
+- [Guide and API reference](docs/API.md) explains channels, backpressure,
+  keyed replacement, event-loop integration, timers, and lifecycle rules.
+- Tests can be run with `doof test event`.
+- [Samples](samples/) show complete programs built with this module.
+
 ## Usage
 
 ```doof
