@@ -3,34 +3,34 @@
 import { Duration } from "std/time"
 
 import class NativeChannel from "native_event.hpp" as doof_event::NativeChannel {
-  static createChannel(
+  isolated static createChannel(
     capacity: int,
     highWater: int,
     lowWater: int,
     keepsAlive: bool,
   ): NativeChannel
-  registerSenderReady(handler: (): void): void
-  registerSenderClosed(handler: (): void): void
-  registerReceiverClosed(handler: (): void): void
-  tryClose(): bool
+  isolated registerSenderReady(handler: (): void): void
+  isolated registerSenderClosed(handler: (): void): void
+  isolated registerReceiverClosed(handler: (): void): void
+  isolated tryClose(): bool
 }
 
-import function _trySendChannelMessage<T>(
+import isolated function _trySendChannelMessage<T>(
   channel: NativeChannel,
   value: T,
   hasKey: bool,
   key: string,
 ): int from "native_event.hpp" as doof_event::trySendChannelMessage
 
-import function _registerChannelReceiverMessage<T>(
+import isolated function _registerChannelReceiverMessage<T>(
   channel: NativeChannel,
   handler: (value: T): void,
 ): void from "native_event.hpp" as doof_event::registerChannelReceiverMessage
 
 import class NativeTimer from "native_event.hpp" as doof_event::NativeTimer {
-  static createTimeout(delayNanos: long, keepsAlive: bool, handler: (): void): NativeTimer
-  static createInterval(intervalNanos: long, keepsAlive: bool, handler: (): void): NativeTimer
-  cancel(): bool
+  isolated static createTimeout(delayNanos: long, keepsAlive: bool, handler: (): void): NativeTimer
+  isolated static createInterval(intervalNanos: long, keepsAlive: bool, handler: (): void): NativeTimer
+  isolated cancel(): bool
 }
 
 import function _runMainEventLoop(): void from "native_event.hpp" as doof_event::runMainEventLoop
