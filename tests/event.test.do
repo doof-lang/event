@@ -14,15 +14,15 @@ import {
   setTimeout,
 } from "../index"
 
-function collectIntMessages(target: int[]): (value: int): void {
-  return (value: int): void => {
+function collectIntMessages(target: int[]): (value: int): none {
+  return (value: int): none => {
     target.push(value)
   }
 }
 
 class ActorChannelState {
   values: int[] = []
-  timer: Timer | null = null
+  timer: Timer | none = none
 
   openChannel(
     capacity: int = 4,
@@ -44,31 +44,31 @@ class ActorChannelState {
     return (sender, receiver)
   }
 
-  attachReceiver(receiver: ChannelReceiver<int>): void {
-    receiver.onMessage((value: int): void => this.values.push(value))
-    receiver.onClosed((): void => this.values.push(-2))
+  attachReceiver(receiver: ChannelReceiver<int>): none {
+    receiver.onMessage((value: int): none => this.values.push(value))
+    receiver.onClosed((): none => this.values.push(-2))
   }
 
-  mark(value: int): void {
+  mark(value: int): none {
     this.values.push(value)
   }
 
-  sleepMillis(millis: long): void {
+  sleepMillis(millis: long): none {
     Thread.sleep(Duration.ofMillis(millis))
   }
 
-  startTimeout(): void {
+  startTimeout(): none {
     setTimeout{
       delay: Duration.ZERO,
-      handler: (): void => this.values.push(90),
+      handler: (): none => this.values.push(90),
       keepsAlive: true,
     }
   }
 
-  startInterval(): void {
+  startInterval(): none {
     this.timer = setInterval{
       interval: Duration.ofMillis(1L),
-      handler: (): void => {
+      handler: (): none => {
         this.values.push(91)
         this.timer!.cancel()
       },
@@ -84,16 +84,16 @@ class ActorChannelState {
 class ActorChannelSender {
   values: int[] = []
 
-  attachSender(sender: ChannelSender<int>): void {
+  attachSender(sender: ChannelSender<int>): none {
     sender.onReady() { this.values.push(-1) }
     sender.onClosed() { this.values.push(-2) }
   }
 
-  deliver(sender: ChannelSender<int>, value: int): void {
+  deliver(sender: ChannelSender<int>, value: int): none {
     try! sender.send(value)
   }
 
-  dispatch(callback: (): void): void {
+  dispatch(callback: (): none): none {
     callback.dispatch()
   }
 
@@ -102,7 +102,7 @@ class ActorChannelSender {
   at(index: int): int => this.values[index]
 }
 
-export function testDrainMainEventLoopDispatchesReadyValuesWithoutBlocking(): void {
+export function testDrainMainEventLoopDispatchesReadyValuesWithoutBlocking(): none {
   let handled: int[] = []
   (sender, receiver) := createChannel<int>{
     capacity: 4,
@@ -124,11 +124,11 @@ export function testDrainMainEventLoopDispatchesReadyValuesWithoutBlocking(): vo
   Assert.equal(drainMainEventLoop(), 0)
 }
 
-export function testDrainMainEventLoopReturnsZeroWhenNoWorkIsReady(): void {
+export function testDrainMainEventLoopReturnsZeroWhenNoWorkIsReady(): none {
   Assert.equal(drainMainEventLoop(), 0)
 }
 
-export function testActorOwnedChannelDispatchesMessageOnOwningActor(): void {
+export function testActorOwnedChannelDispatchesMessageOnOwningActor(): none {
   owner := Actor<ActorChannelState>()
   (sender, receiver) := owner.openChannel()
 
@@ -143,7 +143,7 @@ export function testActorOwnedChannelDispatchesMessageOnOwningActor(): void {
   retired := retire owner
 }
 
-export function testActorOwnedChannelPreservesMailboxOrdering(): void {
+export function testActorOwnedChannelPreservesMailboxOrdering(): none {
   owner := Actor<ActorChannelState>()
   (sender, receiver) := owner.openChannel()
 
@@ -165,7 +165,7 @@ export function testActorOwnedChannelPreservesMailboxOrdering(): void {
   retired := retire owner
 }
 
-export function testActorOwnedChannelDispatchesClosedOnOwningReceiver(): void {
+export function testActorOwnedChannelDispatchesClosedOnOwningReceiver(): none {
   owner := Actor<ActorChannelState>()
   (sender, receiver) := owner.openChannel(3, 2, 0)
 
@@ -182,7 +182,7 @@ export function testActorOwnedChannelDispatchesClosedOnOwningReceiver(): void {
   retired := retire owner
 }
 
-export function testActorOwnedChannelAcceptsSendFromAnotherActor(): void {
+export function testActorOwnedChannelAcceptsSendFromAnotherActor(): none {
   owner := Actor<ActorChannelState>()
   senderActor := Actor<ActorChannelSender>()
   (sender, receiver) := owner.openChannel()
@@ -199,10 +199,10 @@ export function testActorOwnedChannelAcceptsSendFromAnotherActor(): void {
   retiredOwner := retire owner
 }
 
-export function testRootCallbackDispatchedFromActorRunsOnMainDrain(): void {
+export function testRootCallbackDispatchedFromActorRunsOnMainDrain(): none {
   sender := Actor<ActorChannelSender>()
   let value = 0
-  callback := (): void => {
+  callback := (): none => {
     value = 42
   }
 
@@ -215,7 +215,7 @@ export function testRootCallbackDispatchedFromActorRunsOnMainDrain(): void {
   retired := retire sender
 }
 
-export function testActorOwnedChannelDoesNotNeedMainDrainWhileMainSleeps(): void {
+export function testActorOwnedChannelDoesNotNeedMainDrainWhileMainSleeps(): none {
   owner := Actor<ActorChannelState>()
   (sender, receiver) := owner.openChannel()
 
@@ -231,7 +231,7 @@ export function testActorOwnedChannelDoesNotNeedMainDrainWhileMainSleeps(): void
   retired := retire owner
 }
 
-export function testActorOwnedChannelBackpressureClearsOnlyAfterActorPumpRuns(): void {
+export function testActorOwnedChannelBackpressureClearsOnlyAfterActorPumpRuns(): none {
   owner := Actor<ActorChannelState>()
   senderActor := Actor<ActorChannelSender>()
   (sender, receiver) := owner.openChannel(2, 2, 1)
@@ -263,7 +263,7 @@ export function testActorOwnedChannelBackpressureClearsOnlyAfterActorPumpRuns():
   retiredSender := retire senderActor
 }
 
-export function testActorOwnedChannelPumpYieldsAfterBoundedBatch(): void {
+export function testActorOwnedChannelPumpYieldsAfterBoundedBatch(): none {
   owner := Actor<ActorChannelState>()
   (sender, receiver) := owner.openChannel(64, 64, 32)
   blocker := async owner.sleepMillis(40L)
@@ -289,7 +289,7 @@ export function testActorOwnedChannelPumpYieldsAfterBoundedBatch(): void {
   retired := retire owner
 }
 
-export function testTimeoutCreatedInsideActorDispatchesOnOwningActor(): void {
+export function testTimeoutCreatedInsideActorDispatchesOnOwningActor(): none {
   owner := Actor<ActorChannelState>()
 
   owner.startTimeout()
@@ -301,7 +301,7 @@ export function testTimeoutCreatedInsideActorDispatchesOnOwningActor(): void {
   retired := retire owner
 }
 
-export function testIntervalCreatedInsideActorDispatchesOnOwningActor(): void {
+export function testIntervalCreatedInsideActorDispatchesOnOwningActor(): none {
   owner := Actor<ActorChannelState>()
 
   owner.startInterval()
@@ -313,7 +313,7 @@ export function testIntervalCreatedInsideActorDispatchesOnOwningActor(): void {
   retired := retire owner
 }
 
-export function testChannelDispatchesQueuedMessages(): void {
+export function testChannelDispatchesQueuedMessages(): none {
   let handled: int[] = []
   (sender, receiver) := createChannel<int>{
     capacity: 4,
@@ -335,7 +335,7 @@ export function testChannelDispatchesQueuedMessages(): void {
   Assert.equal(handled[2], 3)
 }
 
-export function testChannelBuffersMessagesUntilReceiverRegisters(): void {
+export function testChannelBuffersMessagesUntilReceiverRegisters(): none {
   let handled: int[] = []
   (sender, receiver) := createChannel<int>{
     capacity: 4,
@@ -358,14 +358,14 @@ export function testChannelBuffersMessagesUntilReceiverRegisters(): void {
   Assert.equal(handled[1], 20)
 }
 
-export function testChannelReportsBackpressureAndFull(): void {
+export function testChannelReportsBackpressureAndFull(): none {
   (sender, receiver) := createChannel<int>{
     capacity: 2,
     highWater: 2,
     lowWater: 1,
     keepsAlive: false,
   }
-  receiver.onMessage((value: int): void => {})
+  receiver.onMessage((value: int): none => {})
 
   first := try! sender.send(1)
   second := try! sender.send(2)
@@ -381,7 +381,7 @@ export function testChannelReportsBackpressureAndFull(): void {
   runMainEventLoop()
 }
 
-export function testChannelCoalescesPendingMessagesByKey(): void {
+export function testChannelCoalescesPendingMessagesByKey(): none {
   let handled: int[] = []
   let ready: int[] = []
   (sender, receiver) := createChannel<int>{
@@ -391,7 +391,7 @@ export function testChannelCoalescesPendingMessagesByKey(): void {
     keepsAlive: false,
   }
   receiver.onMessage(collectIntMessages(handled))
-  sender.onReady((): void => ready.push(-1))
+  sender.onReady((): none => ready.push(-1))
 
   try! sender.send(1, "same")
   try! sender.send(2, "other")
@@ -413,7 +413,7 @@ export function testChannelCoalescesPendingMessagesByKey(): void {
   Assert.equal(ready[0], -1)
 }
 
-export function testChannelReadyFiresOncePerHighWaterRecovery(): void {
+export function testChannelReadyFiresOncePerHighWaterRecovery(): none {
   let handled: int[] = []
   let ready: int[] = []
   (sender, receiver) := createChannel<int>{
@@ -447,7 +447,7 @@ export function testChannelReadyFiresOncePerHighWaterRecovery(): void {
   Assert.equal(ready.length, 1)
 }
 
-export function testChannelReadyWaitsUntilSenderRegistersHandler(): void {
+export function testChannelReadyWaitsUntilSenderRegistersHandler(): none {
   let handled: int[] = []
   let ready: int[] = []
   (sender, receiver) := createChannel<int>{
@@ -467,13 +467,13 @@ export function testChannelReadyWaitsUntilSenderRegistersHandler(): void {
   Assert.equal(handled.length, 3)
   Assert.equal(ready.length, 0)
 
-  sender.onReady((): void => ready.push(-1))
+  sender.onReady((): none => ready.push(-1))
   Assert.equal(drainMainEventLoop(), 1)
   Assert.equal(ready.length, 1)
   Assert.equal(ready[0], -1)
 }
 
-export function testChannelSenderClosedDoesNotWaitForUnregisteredReady(): void {
+export function testChannelSenderClosedDoesNotWaitForUnregisteredReady(): none {
   let handled: int[] = []
   let senderClosed: int[] = []
   (sender, receiver) := createChannel<int>{
@@ -491,13 +491,13 @@ export function testChannelSenderClosedDoesNotWaitForUnregisteredReady(): void {
   runMainEventLoop()
 
   sender.close()
-  sender.onClosed((): void => senderClosed.push(-3))
+  sender.onClosed((): none => senderClosed.push(-3))
   drainMainEventLoop()
   Assert.equal(senderClosed.length, 1)
   Assert.equal(senderClosed[0], -3)
 }
 
-export function testChannelCloseDrainsThenDeliversClosed(): void {
+export function testChannelCloseDrainsThenDeliversClosed(): none {
   let handled: int[] = []
   let senderClosed: int[] = []
   (sender, receiver) := createChannel<int>{
@@ -507,8 +507,8 @@ export function testChannelCloseDrainsThenDeliversClosed(): void {
     keepsAlive: false,
   }
   receiver.onMessage(collectIntMessages(handled))
-  receiver.onClosed((): void => handled.push(-2))
-  sender.onClosed((): void => senderClosed.push(-3))
+  receiver.onClosed((): none => handled.push(-2))
+  sender.onClosed((): none => senderClosed.push(-3))
 
   try! sender.send(1)
   try! sender.send(2)
@@ -531,7 +531,7 @@ export function testChannelCloseDrainsThenDeliversClosed(): void {
   Assert.equal(senderClosed[0], -3)
 }
 
-export function testChannelClosedWaitsUntilEndpointHandlersRegister(): void {
+export function testChannelClosedWaitsUntilEndpointHandlersRegister(): none {
   let receiverClosed: int[] = []
   let senderClosed: int[] = []
   (sender, receiver) := createChannel<int>{
@@ -544,8 +544,8 @@ export function testChannelClosedWaitsUntilEndpointHandlersRegister(): void {
   sender.close()
   Assert.equal(drainMainEventLoop(), 0)
 
-  receiver.onClosed((): void => receiverClosed.push(-2))
-  sender.onClosed((): void => senderClosed.push(-3))
+  receiver.onClosed((): none => receiverClosed.push(-2))
+  sender.onClosed((): none => senderClosed.push(-3))
   runMainEventLoop()
 
   Assert.equal(receiverClosed.length, 1)
@@ -554,11 +554,11 @@ export function testChannelClosedWaitsUntilEndpointHandlersRegister(): void {
   Assert.equal(senderClosed[0], -3)
 }
 
-export function testTimeoutFiresOnce(): void {
+export function testTimeoutFiresOnce(): none {
   let fired = 0
   timer := setTimeout{
     delay: Duration.ofMillis(1L),
-    handler: (): void => {
+    handler: (): none => {
       fired = fired + 1
     },
   }
@@ -569,11 +569,11 @@ export function testTimeoutFiresOnce(): void {
   Assert.isFalse(timer.cancel())
 }
 
-export function testZeroDelayTimeoutRunsOnNextDrain(): void {
+export function testZeroDelayTimeoutRunsOnNextDrain(): none {
   let fired = false
   timer := setTimeout{
     delay: Duration.ZERO,
-    handler: (): void => {
+    handler: (): none => {
       fired = true
     },
   }
@@ -584,11 +584,11 @@ export function testZeroDelayTimeoutRunsOnNextDrain(): void {
   Assert.isFalse(timer.cancel())
 }
 
-export function testCancelBeforeTimeoutFiresPreventsCallback(): void {
+export function testCancelBeforeTimeoutFiresPreventsCallback(): none {
   let fired = false
   timer := setTimeout{
     delay: Duration.ofMillis(50L),
-    handler: (): void => {
+    handler: (): none => {
       fired = true
     },
   }
@@ -599,10 +599,10 @@ export function testCancelBeforeTimeoutFiresPreventsCallback(): void {
   Assert.isFalse(fired)
 }
 
-export function testRepeatedCancelReportsOnlyFirstCancellation(): void {
+export function testRepeatedCancelReportsOnlyFirstCancellation(): none {
   timer := setTimeout{
     delay: Duration.ofMillis(50L),
-    handler: (): void => {},
+    handler: (): none => {},
   }
 
   Assert.isTrue(timer.cancel())
@@ -610,11 +610,11 @@ export function testRepeatedCancelReportsOnlyFirstCancellation(): void {
   runMainEventLoop()
 }
 
-export function testCancelAfterTimeoutFiredReturnsFalse(): void {
+export function testCancelAfterTimeoutFiredReturnsFalse(): none {
   let fired = false
   timer := setTimeout{
     delay: Duration.ZERO,
-    handler: (): void => {
+    handler: (): none => {
       fired = true
     },
   }
@@ -625,13 +625,13 @@ export function testCancelAfterTimeoutFiredReturnsFalse(): void {
   Assert.isFalse(timer.cancel())
 }
 
-export function testIntervalFiresRepeatedlyAndCancelsItself(): void {
+export function testIntervalFiresRepeatedlyAndCancelsItself(): none {
   let fired = 0
   let timers: Timer[] = []
 
   timer := setInterval{
     interval: Duration.ofMillis(1L),
-    handler: (): void => {
+    handler: (): none => {
       fired = fired + 1
       if fired == 3 {
         Assert.isTrue(timers[0].cancel())

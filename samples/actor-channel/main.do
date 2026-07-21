@@ -8,19 +8,19 @@ import { Duration, Instant, Thread } from "std/time"
 
 function timestamp(): string => Instant.now().toISOString()
 
-function log(source: string, message: string): void {
+function log(source: string, message: string): none {
   println("[${timestamp()}] ${source}: ${message}")
 }
 
 class ConsoleActor {
-  sleep(): void {
+  sleep(): none {
     log("actor", "sleeping for 5 seconds")
     Thread.sleep(Duration.ofSeconds(5L))
     log("actor", "woke up")
   }
-  attachReceiver(receiver: ChannelReceiver<string>): void {
-    receiver.onMessage((message: string): void => log("actor", message))
-    receiver.onClosed((): void => log("actor", "channel closed"))
+  attachReceiver(receiver: ChannelReceiver<string>): none {
+    receiver.onMessage((message: string): none => log("actor", message))
+    receiver.onClosed((): none => log("actor", "channel closed"))
   }
 }
 
@@ -63,8 +63,8 @@ function main(): int {
   actor.attachReceiver(receiver)
 
   producer := Producer { sender, totalMessages: 4 }
-  sender.onReady((): void => producer.pump())
-  sender.onClosed((): void => log("main", "channel closed"))
+  sender.onReady((): none => producer.pump())
+  sender.onClosed((): none => log("main", "channel closed"))
   async actor.sleep()
 
   log("main", "sending messages")

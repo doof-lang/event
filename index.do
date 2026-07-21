@@ -9,9 +9,9 @@ import class NativeChannel from "native_event.hpp" as doof_event::NativeChannel 
     lowWater: int,
     keepsAlive: bool,
   ): NativeChannel
-  isolated registerSenderReady(handler: (): void): void
-  isolated registerSenderClosed(handler: (): void): void
-  isolated registerReceiverClosed(handler: (): void): void
+  isolated registerSenderReady(handler: (): none): none
+  isolated registerSenderClosed(handler: (): none): none
+  isolated registerReceiverClosed(handler: (): none): none
   isolated tryClose(): bool
 }
 
@@ -24,19 +24,19 @@ import isolated function _trySendChannelMessage<T>(
 
 import isolated function _registerChannelReceiverMessage<T>(
   channel: NativeChannel,
-  handler: (value: T): void,
-): void from "native_event.hpp" as doof_event::registerChannelReceiverMessage
+  handler: (value: T): none,
+): none from "native_event.hpp" as doof_event::registerChannelReceiverMessage
 
 import class NativeTimer from "native_event.hpp" as doof_event::NativeTimer {
-  isolated static createTimeout(delayNanos: long, keepsAlive: bool, handler: (): void): NativeTimer
-  isolated static createInterval(intervalNanos: long, keepsAlive: bool, handler: (): void): NativeTimer
+  isolated static createTimeout(delayNanos: long, keepsAlive: bool, handler: (): none): NativeTimer
+  isolated static createInterval(intervalNanos: long, keepsAlive: bool, handler: (): none): NativeTimer
   isolated cancel(): bool
 }
 
-import function _runMainEventLoop(): void from "native_event.hpp" as doof_event::runMainEventLoop
+import function _runMainEventLoop(): none from "native_event.hpp" as doof_event::runMainEventLoop
 import function _drainMainEventLoop(): int from "native_event.hpp" as doof_event::drainMainEventLoop
-import function _setMainEventWakeHandler(handler: (): void): void from "native_event.hpp" as doof_event::setMainEventWakeCallback
-import function _clearMainEventWakeHandler(): void from "native_event.hpp" as doof_event::clearMainEventWakeHandler
+import function _setMainEventWakeHandler(handler: (): none): none from "native_event.hpp" as doof_event::setMainEventWakeCallback
+import function _clearMainEventWakeHandler(): none from "native_event.hpp" as doof_event::clearMainEventWakeHandler
 
 export enum Backpressure {
   None,
@@ -51,8 +51,8 @@ export enum SendError {
 export class ChannelSender<T> {
   private readonly native: NativeChannel
 
-  send(value: T, key: string | null = null): Result<Backpressure, SendError> {
-    code := if key == null then _trySendChannelMessage(this.native, value, false, "") else _trySendChannelMessage(this.native, value, true, key!)
+  send(value: T, key: string | none = none): Result<Backpressure, SendError> {
+    code := if key == none then _trySendChannelMessage(this.native, value, false, "") else _trySendChannelMessage(this.native, value, true, key!)
 
     return case code {
       0 -> Success { value: Backpressure.None },
@@ -62,15 +62,15 @@ export class ChannelSender<T> {
     }
   }
 
-  onReady(handler: (): void): void {
+  onReady(handler: (): none): none {
     this.native.registerSenderReady(handler)
   }
 
-  onClosed(handler: (): void): void {
+  onClosed(handler: (): none): none {
     this.native.registerSenderClosed(handler)
   }
 
-  close(): void {
+  close(): none {
     this.native.tryClose()
   }
 }
@@ -78,15 +78,15 @@ export class ChannelSender<T> {
 export class ChannelReceiver<T> {
   private readonly native: NativeChannel
 
-  onMessage(handler: (it: T): void): void {
+  onMessage(handler: (it: T): none): none {
     _registerChannelReceiverMessage(this.native, handler)
   }
 
-  onClosed(handler: (): void): void {
+  onClosed(handler: (): none): none {
     this.native.registerReceiverClosed(handler)
   }
 
-  close(): void {
+  close(): none {
     this.native.tryClose()
   }
 }
@@ -127,7 +127,7 @@ export class Timer {
 
 export function setTimeout(
   delay: Duration,
-  handler: (): void,
+  handler: (): none,
   keepsAlive: bool = true,
 ): Timer {
   if delay.isNegative() {
@@ -135,12 +135,12 @@ export function setTimeout(
   }
 
   timerHandler := handler
-  return Timer(NativeTimer.createTimeout(delay.toNanos(), keepsAlive, (): void => timerHandler.call()))
+  return Timer(NativeTimer.createTimeout(delay.toNanos(), keepsAlive, (): none => timerHandler.call()))
 }
 
 export function setInterval(
   interval: Duration,
-  handler: (): void,
+  handler: (): none,
   keepsAlive: bool = true,
 ): Timer {
   if interval.toNanos() <= 0L {
@@ -148,14 +148,14 @@ export function setInterval(
   }
 
   timerHandler := handler
-  return Timer(NativeTimer.createInterval(interval.toNanos(), keepsAlive, (): void => timerHandler.call()))
+  return Timer(NativeTimer.createInterval(interval.toNanos(), keepsAlive, (): none => timerHandler.call()))
 }
 
 // First-cut explicit pump for hosts that do not yet have runtime integration.
 // It blocks efficiently while keep-alive channels remain open, dispatches
 // channel handlers on the calling thread, and returns once no keep-alive
 // channels remain and the ready queue has drained.
-export function runMainEventLoop(): void {
+export function runMainEventLoop(): none {
   _runMainEventLoop()
 }
 
@@ -166,10 +166,10 @@ export function drainMainEventLoop(): int {
   return _drainMainEventLoop()
 }
 
-export function setMainEventWakeHandler(handler: (): void): void {
+export function setMainEventWakeHandler(handler: (): none): none {
   _setMainEventWakeHandler(handler)
 }
 
-export function clearMainEventWakeHandler(): void {
+export function clearMainEventWakeHandler(): none {
   _clearMainEventWakeHandler()
 }
