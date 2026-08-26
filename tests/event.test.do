@@ -22,7 +22,7 @@ function collectIntMessages(target: int[]): (value: int): none {
 
 class ActorChannelState {
   values: int[] = []
-  timer: Timer | none = none
+  let timer: Timer | none = none
 
   openChannel(
     capacity: int = 4,

@@ -25,7 +25,7 @@ class ConsoleActor {
 }
 
 class Producer {
-  idx = 0
+  let idx = 0
   sender: ChannelSender<string>
   totalMessages: int
 
@@ -79,5 +79,5 @@ runMainEventLoop()
 //  sender.close()
 
   //retired := retire actor
-  //return 0
+  return 0
 }
