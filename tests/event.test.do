@@ -90,7 +90,7 @@ class ActorChannelSender {
   }
 
   deliver(sender: ChannelSender<int>, value: int): none {
-    try! sender.send(value)
+    sender.send(value)!
   }
 
   dispatch(callback: (): none): none {
@@ -112,8 +112,8 @@ export function testDrainMainEventLoopDispatchesReadyValuesWithoutBlocking(): no
   }
   receiver.onMessage(collectIntMessages(handled))
 
-  try! sender.send(10)
-  try! sender.send(20)
+  sender.send(10)!
+  sender.send(20)!
 
   dispatched := drainMainEventLoop()
 
@@ -132,7 +132,7 @@ export function testActorOwnedChannelDispatchesMessageOnOwningActor(): none {
   owner := Actor<ActorChannelState>()
   (sender, receiver) := owner.openChannel()
 
-  try! sender.send(42)
+  sender.send(42)!
   Assert.equal(drainMainEventLoop(), 0)
 
   Assert.equal(owner.count(), 1)
@@ -148,12 +148,12 @@ export function testActorOwnedChannelPreservesMailboxOrdering(): none {
   (sender, receiver) := owner.openChannel()
 
   first := async owner.mark(1)
-  try! sender.send(2)
+  sender.send(2)!
   Assert.equal(drainMainEventLoop(), 0)
   last := async owner.mark(3)
 
-  try! first.get()
-  try! last.get()
+  first.get()!
+  last.get()!
 
   Assert.equal(owner.count(), 3)
   Assert.equal(owner.at(0), 1)
@@ -169,8 +169,8 @@ export function testActorOwnedChannelDispatchesClosedOnOwningReceiver(): none {
   owner := Actor<ActorChannelState>()
   (sender, receiver) := owner.openChannel(3, 2, 0)
 
-  try! sender.send(10)
-  high := try! sender.send(20)
+  sender.send(10)!
+  high := sender.send(20)!
   Assert.equal(high, Backpressure.High)
   receiver.close()
 
@@ -219,7 +219,7 @@ export function testActorOwnedChannelDoesNotNeedMainDrainWhileMainSleeps(): none
   owner := Actor<ActorChannelState>()
   (sender, receiver) := owner.openChannel()
 
-  try! sender.send(42)
+  sender.send(42)!
   Thread.sleep(Duration.ofMillis(20L))
 
   Assert.equal(drainMainEventLoop(), 0)
@@ -238,8 +238,8 @@ export function testActorOwnedChannelBackpressureClearsOnlyAfterActorPumpRuns():
   senderActor.attachSender(sender)
   blocker := async owner.sleepMillis(40L)
 
-  first := try! sender.send(1)
-  second := try! sender.send(2)
+  first := sender.send(1)!
+  second := sender.send(2)!
   overflow := sender.send(3)
 
   Assert.equal(first, Backpressure.None)
@@ -249,7 +249,7 @@ export function testActorOwnedChannelBackpressureClearsOnlyAfterActorPumpRuns():
     f: Failure -> Assert.equal(f.error, SendError.Full)
   }
 
-  try! blocker.get()
+  blocker.get()!
   Assert.equal(owner.count(), 2)
   Assert.equal(owner.at(0), 1)
   Assert.equal(owner.at(1), 2)
@@ -270,13 +270,13 @@ export function testActorOwnedChannelPumpYieldsAfterBoundedBatch(): none {
 
   let index = 0
   while index < 40 {
-    try! sender.send(index)
+    sender.send(index)!
     index = index + 1
   }
 
   marker := async owner.mark(999)
-  try! blocker.get()
-  try! marker.get()
+  blocker.get()!
+  marker.get()!
 
   Assert.equal(owner.count(), 41)
   Assert.equal(owner.at(31), 31)
@@ -323,9 +323,9 @@ export function testChannelDispatchesQueuedMessages(): none {
   }
   receiver.onMessage(collectIntMessages(handled))
 
-  try! sender.send(1)
-  try! sender.send(2)
-  try! sender.send(3)
+  sender.send(1)!
+  sender.send(2)!
+  sender.send(3)!
 
   runMainEventLoop()
 
@@ -344,8 +344,8 @@ export function testChannelBuffersMessagesUntilReceiverRegisters(): none {
     keepsAlive: false,
   }
 
-  try! sender.send(10)
-  try! sender.send(20)
+  sender.send(10)!
+  sender.send(20)!
 
   Assert.equal(drainMainEventLoop(), 0)
   Assert.equal(handled.length, 0)
@@ -367,8 +367,8 @@ export function testChannelReportsBackpressureAndFull(): none {
   }
   receiver.onMessage((value: int): none => {})
 
-  first := try! sender.send(1)
-  second := try! sender.send(2)
+  first := sender.send(1)!
+  second := sender.send(2)!
   overflow := sender.send(3)
 
   Assert.equal(first, Backpressure.None)
@@ -393,10 +393,10 @@ export function testChannelCoalescesPendingMessagesByKey(): none {
   receiver.onMessage(collectIntMessages(handled))
   sender.onReady((): none => ready.push(-1))
 
-  try! sender.send(1, "same")
-  try! sender.send(2, "other")
+  sender.send(1, "same")!
+  sender.send(2, "other")!
   overflow := sender.send(3)
-  coalesced := try! sender.send(4, "same")
+  coalesced := sender.send(4, "same")!
 
   case overflow {
     s: Success -> Assert.fail("expected unkeyed send to fail")
@@ -425,9 +425,9 @@ export function testChannelReadyFiresOncePerHighWaterRecovery(): none {
   receiver.onMessage(collectIntMessages(handled))
   sender.onReady() { ready.push(-1) }
 
-  try! sender.send(1)
-  try! sender.send(2)
-  high := try! sender.send(3)
+  sender.send(1)!
+  sender.send(2)!
+  high := sender.send(3)!
 
   Assert.equal(high, Backpressure.High)
   runMainEventLoop()
@@ -439,7 +439,7 @@ export function testChannelReadyFiresOncePerHighWaterRecovery(): none {
   Assert.equal(ready.length, 1)
   Assert.equal(ready[0], -1)
 
-  try! sender.send(4)
+  sender.send(4)!
   runMainEventLoop()
 
   Assert.equal(handled.length, 4)
@@ -458,9 +458,9 @@ export function testChannelReadyWaitsUntilSenderRegistersHandler(): none {
   }
   receiver.onMessage(collectIntMessages(handled))
 
-  try! sender.send(1)
-  try! sender.send(2)
-  high := try! sender.send(3)
+  sender.send(1)!
+  sender.send(2)!
+  high := sender.send(3)!
   Assert.equal(high, Backpressure.High)
 
   runMainEventLoop()
@@ -484,9 +484,9 @@ export function testChannelSenderClosedDoesNotWaitForUnregisteredReady(): none {
   }
   receiver.onMessage(collectIntMessages(handled))
 
-  try! sender.send(1)
-  try! sender.send(2)
-  high := try! sender.send(3)
+  sender.send(1)!
+  sender.send(2)!
+  high := sender.send(3)!
   Assert.equal(high, Backpressure.High)
   runMainEventLoop()
 
@@ -510,8 +510,8 @@ export function testChannelCloseDrainsThenDeliversClosed(): none {
   receiver.onClosed((): none => handled.push(-2))
   sender.onClosed((): none => senderClosed.push(-3))
 
-  try! sender.send(1)
-  try! sender.send(2)
+  sender.send(1)!
+  sender.send(2)!
   receiver.close()
   sender.close()
   afterClose := sender.send(3)
