@@ -1,53 +1,35 @@
 # std/event
 
-`std/event` provides event-delivery primitives for Doof programs: one-way
-channels for handing work to an endpoint, explicit main-loop pumping hooks, and
-scheduled timers.
+`std/event` provides the root event loop and timers for Doof programs: explicit
+main-loop pumping hooks, a hold that keeps the loop running, and scheduled
+timers.
 
-Channels are bounded queues split into two endpoint objects. A
-`ChannelSender<T>` can enqueue values, observe backpressure, and close the
-queue. A `ChannelReceiver<T>` can install the message handler, observe closure,
-and close the same queue from the receiving side. The channel itself is not a
-bidirectional conversation: values only flow from sender to receiver. If a
-protocol needs replies or two independent streams, create a second channel and
-pass the opposite endpoints to the participating actors or native integrations.
-
-This endpoint split is useful when ownership matters. A native listener can
-hold only the sender for inbound requests, an actor can hold only the receiver
-for actor-affine callbacks, and a producer can react to `onReady` without being
-able to consume messages.
+Handing work to another actor needs no channel. Every function value belongs to
+the actor that created it, and `callback.post(...)` or the non-blocking
+`callback.tryPost(...)` queues a call there. Native sources such as
+`std/http-server` and `std/http` WebSockets deliver events the same way.
 
 ## Documentation
 
-- [Guide and API reference](docs/API.md) explains channels, backpressure,
-  keyed replacement, event-loop integration, timers, and lifecycle rules.
+- [Guide and API reference](docs/API.md) explains the event loop, keep-alive
+  sources, cross-actor delivery and backpressure with `tryPost`, timers, and
+  lifecycle rules.
 - Tests can be run with `doof test event`.
-- [Samples](samples/) show complete programs built with this module.
 
 ## Usage
 
 ```doof
-import { createChannel, runMainEventLoop, setTimeout } from "std/event"
+import { runMainEventLoop, setTimeout } from "std/event"
 import { Duration } from "std/time"
 
 function main(): int {
-  (sender, receiver) := createChannel<string>{
-    capacity: 256,
-    keepsAlive: false,
-  }
-
-  receiver.onMessage((message: string): void => println(message))
-  receiver.onClosed((): void => println("receiver closed"))
-  sender.onReady((): void => println("ready for more"))
-  sender.onClosed((): void => println("sender closed"))
+  report := (message: string): none => println(message)
+  report.post("hello from the event queue")
 
   timer := setTimeout{
     delay: Duration.ofMillis(100L),
-    handler: (): void => try! sender.send("hello from a timer"),
+    handler: (): none => println("hello from a timer"),
   }
-
-  try! sender.send("hello from the event queue")
-  sender.close()
 
   runMainEventLoop()
   return 0
@@ -56,77 +38,26 @@ function main(): int {
 
 ## Exports
 
-### Channels
-
-```doof
-enum Backpressure { None, High }
-enum SendError { Full, Closed }
-
-class ChannelSender<T> {
-  send(value: T, key: string | null = null): Result<Backpressure, SendError>
-  onReady(handler: (): void): void
-  onClosed(handler: (): void): void
-  close(): void
-}
-
-class ChannelReceiver<T> {
-  onMessage(handler: (value: T): void): void
-  onClosed(handler: (): void): void
-  close(): void
-}
-
-createChannel{ ... }: Tuple<ChannelSender<T>, ChannelReceiver<T>>
-```
-
-Channels are bounded, nonblocking ingress points for handing immutable values to
-an endpoint. They are a good fit for native event sources, producer-to-actor
-handoff, and future cross-thread communication. Values sent through channels are
-intended to be immutable when they cross native or thread boundaries; the
-current compiler does not yet expose an `Immutable` generic constraint, so this
-is documented as an API contract rather than encoded in the type parameter.
-
-```doof
-(sender, receiver) := createChannel<string>{
-  capacity: 256,
-  highWater: 192,
-  lowWater: 128,
-}
-
-receiver.onMessage((message: string): void => println(message))
-sender.onReady((): void => println("ready for more"))
-```
-
-`ChannelSender.send(...)` returns `Backpressure.None` while the queue remains
-below `highWater`, and `Backpressure.High` once the queued message count reaches
-or exceeds `highWater`. If the queue is already at capacity, it fails with
-`SendError.Full`; after `close()`, it fails with `SendError.Closed`.
-
-When a non-null `key` is supplied, a pending message with the same key is
-replaced in place instead of consuming another capacity slot. The original FIFO
-position for that key is preserved. Unkeyed messages are always appended.
-
-After high backpressure has been reported, the sender receives one `onReady`
-callback when dispatch lowers queued depth to `lowWater` or below. Sending
-before `receiver.onMessage(...)` is registered is allowed; messages remain
-buffered until the receiver endpoint installs its message handler.
-
-`close()` on either endpoint stops accepting new messages immediately. Pending
-messages drain to the receiver, then `receiver.onClosed(...)` is delivered.
-`sender.onClosed(...)` is delivered to the sender endpoint. Repeated `close()`
-calls are no-ops, and ready/closed notifications that occur before their
-callback is registered are delivered after registration.
-
-When omitted, `highWater` defaults to the channel capacity and `lowWater`
-defaults to half of the effective `highWater`.
-
 ### `runMainEventLoop()`
 
-Blocks efficiently on the calling thread, dispatching queued handlers until no
-keep-alive channels or timers remain open and the ready queue has drained.
+Blocks efficiently on the calling thread, dispatching queued root work until no
+keep-alive sources (timers, holds, open servers and connections) remain and the
+root mailbox has drained.
 
 This is the first-cut explicit host hook. Longer term, ordinary applications
 should not need to expose an event-loop concept directly; generated hosts can
 call the same runtime hook themselves.
+
+### `retainMainEventLoop()`
+
+```doof
+hold := retainMainEventLoop()
+hold.release()
+```
+
+Keeps `runMainEventLoop()` running until the returned `MainEventLoopHold` is
+released or dropped. `release()` returns `true` only for the call that released
+the hold.
 
 ### `drainMainEventLoop()`
 
@@ -166,7 +97,7 @@ committed to dispatch.
 ```doof
 setTimeout{
   delay: Duration.ofMillis(250L),
-  handler: (): void => ...,
+  handler: (): none => ...,
   keepsAlive: true,
 }
 ```
@@ -184,7 +115,7 @@ does not keep the loop alive by itself.
 ```doof
 timer := setInterval{
   interval: Duration.ofSeconds(1L),
-  handler: (): void => println("tick"),
+  handler: (): none => println("tick"),
 }
 
 canceled := timer.cancel()

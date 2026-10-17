@@ -1,56 +1,47 @@
 # std/event Guide and API Reference
 
-`std/event` provides the low-level event-delivery pieces used by Doof hosts and
-libraries: bounded one-way channels, explicit main event-loop hooks, and timers.
+`std/event` provides the root event-loop hooks and timers used by Doof hosts
+and libraries.
 
-Use it when some producer needs to hand work to another execution context
-without blocking: a native callback delivering into Doof, a background actor
-sending work to an actor-owned receiver, or a host event loop waking Doof code on
-the main thread.
+Moving work between actors is not part of this module. Every function value is
+an actor-affine callback: `callback.post(...)` queues a call on the actor that
+created it, and `callback.tryPost(...)` does the same without waiting for
+mailbox capacity. Native callbacks deliver into Doof the same way.
 
 ## Mental Model
 
 `std/event` has three moving parts:
 
-- **Channels** move values from a `ChannelSender<T>` to a
-  `ChannelReceiver<T>`. The sender and receiver are separate objects so each
-  side can own only the capabilities it needs.
-- **The main event loop** dispatches callbacks that belong to the root runtime
-  context. Applications can call `runMainEventLoop()`, while native or UI hosts
-  can integrate with `drainMainEventLoop()`.
-- **Timers** schedule callbacks onto the same event delivery system after a
-  delay or at an interval.
-
-Channels are not request/reply streams. If a protocol needs responses, create a
-second channel and pass the opposite endpoints to the two participants.
+- **The main event loop** dispatches work queued on the root application actor:
+  posted callbacks, root timers, and events from native sources such as servers
+  and sockets. Applications call `runMainEventLoop()`; native or UI hosts
+  integrate with `drainMainEventLoop()`.
+- **Keep-alive sources** decide when `runMainEventLoop()` returns. Timers,
+  `MainEventLoopHold`s, and open native sources such as an HTTP server or a
+  WebSocket connection each keep the loop running.
+- **Timers** schedule callbacks after a delay or at an interval on the actor
+  that created them.
 
 ## Quick Start
 
 ```doof
-import { createChannel, runMainEventLoop, setTimeout } from "std/event"
+import { runMainEventLoop, setTimeout } from "std/event"
 import { Duration } from "std/time"
 
-function main(): int {
-  (sender, receiver) := createChannel<string>{
-    capacity: 8,
-    highWater: 6,
-    lowWater: 3,
-    keepsAlive: false,
+class Worker {
+  work(report: (message: string): none): none {
+    // Runs on the worker actor; `report` runs back on the root actor.
+    report.post("done on the worker")
   }
+}
 
-  receiver.onMessage((message: string): void => println(message))
-  receiver.onClosed((): void => println("closed"))
-
-  sender.onReady((): void => println("queue recovered"))
-
-  try! sender.send("queued immediately")
+function main(): int {
+  worker := Actor<Worker>()
+  worker.work((message: string): none => println(message))
 
   timer := setTimeout{
     delay: Duration.ofMillis(100L),
-    handler: (): void => {
-      try! sender.send("queued from timer")
-      sender.close()
-    },
+    handler: (): none => println("later"),
   }
 
   runMainEventLoop()
@@ -58,181 +49,43 @@ function main(): int {
 }
 ```
 
-Messages can be sent before `receiver.onMessage(...)` is registered. They remain
-buffered until the receiver installs its handler.
+## Delivering Work Without Channels
 
-## Channels
+A producer that must not block uses `tryPost`. It fails with `"full"` when the
+owner's mailbox is at capacity and `"retired"` when the owner is gone; nothing
+is queued on failure.
 
-Create a channel with `createChannel<T>{...}`:
-
-```doof
-(sender, receiver) := createChannel<int>{
-  capacity: 256,
-  highWater: 192,
-  lowWater: 128,
-  keepsAlive: true,
-}
-```
-
-Arguments:
-
-- `capacity`: maximum number of pending messages. Must be positive. Defaults to
-  `256`.
-- `highWater`: queue depth at which `send(...)` starts reporting
-  `Backpressure.High`. Defaults to `capacity` when omitted or `0`.
-- `lowWater`: queue depth at which the sender is considered ready again after
-  high backpressure. Defaults to half of `highWater` when omitted or negative.
-- `keepsAlive`: whether the open channel keeps `runMainEventLoop()` alive.
-  Defaults to `true`.
-
-`highWater` must be between `1` and `capacity`. `lowWater` must be between `0`
-and `highWater`.
-
-### Sending
-
-`send(value)` is nonblocking and returns `Result<Backpressure, SendError>`:
-
-- `Success(Backpressure.None)`: the message was queued below high water.
-- `Success(Backpressure.High)`: the message was queued and the queue is now at
-  or above high water.
-- `Failure(SendError.Full)`: capacity is exhausted.
-- `Failure(SendError.Closed)`: either endpoint has closed the channel.
-
-```doof
-result := sender.send(value)
-
-case result {
-  s: Success -> {
-    if s.value == Backpressure.High {
-      println("pause producer until onReady")
-    }
-  },
-  f: Failure -> {
-    case f.error {
-      SendError.Full -> println("queue is full")
-      SendError.Closed -> println("channel is closed")
-    }
-  },
-}
-```
-
-Values sent through channels are intended to be immutable when they cross native
-or thread boundaries. The current compiler does not yet expose an `Immutable`
-generic constraint, so this is an API contract rather than something encoded in
-`T`.
-
-### Backpressure
-
-Backpressure is cooperative. A channel does not block the sender; it tells the
-sender when to slow down.
+Per-producer backpressure counts calls that have been posted but not yet
+handled. The promise from `tryPost` completes once the handler has run, so it
+is the natural place to resume:
 
 ```doof
 class Producer {
-  sender: ChannelSender<string>
-  next = 0
+  let inFlight = 0
+  let next = 0
+  readonly limit = 64
+  handle: (value: int): none
 
-  pump(): void {
-    while true {
-      result := sender.send("message ${next}") else { return }
-      next = next + 1
-
-      if result == Backpressure.High {
-        return
+  pump(): none {
+    while this.inFlight < this.limit {
+      case this.handle.tryPost(this.next) {
+        s: Success -> {
+          this.inFlight += 1
+          this.next += 1
+          s.value.onComplete((result) => {
+            this.inFlight -= 1
+            this.pump()
+          })
+        }
+        _: Failure -> return
       }
     }
   }
 }
-
-producer := Producer { sender }
-sender.onReady((): void => producer.pump())
-producer.pump()
 ```
 
-After a send reports `Backpressure.High`, the sender receives one `onReady`
-callback when dispatch lowers the queued depth to `lowWater` or below. It will
-not receive another ready callback until the queue reaches high water again and
-recovers again.
-
-If the queue is full, an unkeyed send fails with `SendError.Full`; no message is
-queued.
-
-### Keyed Replacement
-
-`send(value, key)` can coalesce pending work. When `key` is non-null and a
-pending message with the same key already exists, the new value replaces the old
-value in that same FIFO position instead of consuming another capacity slot.
-
-```doof
-try! sender.send(10, "progress")
-try! sender.send(20, "progress")
-try! sender.send(30, "progress")
-```
-
-The receiver sees only `30` for the `"progress"` slot, ordered where the first
-`"progress"` message was queued. Unkeyed messages are always appended and never
-replace earlier messages.
-
-Keyed replacement is useful for redraw requests, progress updates, status
-snapshots, and other "latest value wins" signals.
-
-### Receiving
-
-Install a message handler with `receiver.onMessage(...)`:
-
-```doof
-receiver.onMessage((value: int): void => {
-  println("received ${value}")
-})
-```
-
-Handlers run in the context that owns the receiver. If an actor creates or owns
-the receiver and registers the handler, delivered messages run on that actor and
-preserve the actor mailbox ordering relative to other actor work.
-
-```doof
-class Worker {
-  attach(receiver: ChannelReceiver<string>): void {
-    receiver.onMessage((message: string): void => this.handle(message))
-  }
-
-  handle(message: string): void {
-    println(message)
-  }
-}
-
-worker := Actor<Worker>()
-(sender, receiver) := createChannel<string>{ keepsAlive: false }
-worker.attach(receiver)
-try! sender.send("runs on the worker actor")
-```
-
-Actor-owned channels do not require `drainMainEventLoop()` for delivery to that
-actor. Root callbacks, root-owned receivers, and root timers are delivered by
-the main event loop.
-
-### Closing
-
-Either endpoint can close the channel:
-
-```doof
-sender.close()
-receiver.close()
-```
-
-Close behavior:
-
-- New sends fail immediately with `SendError.Closed`.
-- Pending messages still drain to the receiver.
-- `receiver.onClosed(...)` runs after pending messages have drained.
-- `sender.onClosed(...)` runs for the sender endpoint.
-- Repeated `close()` calls are no-ops.
-- Ready and closed notifications that occur before their handler is registered
-  are delivered after registration.
-
-```doof
-receiver.onClosed((): void => println("receiver drained and closed"))
-sender.onClosed((): void => println("sender closed"))
-```
+To coalesce "latest value wins" updates such as progress or redraw requests,
+keep the pending value on the producer and post a single flush that reads it.
 
 ## Event Loop Integration
 
@@ -242,18 +95,27 @@ sender.onClosed((): void => println("sender closed"))
 runMainEventLoop()
 ```
 
-Blocks the calling thread and dispatches ready root work until both of these are
+Blocks the calling thread and dispatches root work until both of these are
 true:
 
-- no keep-alive channels or timers remain open
-- the ready queue has drained
+- no keep-alive sources remain
+- the root mailbox has drained
 
 This is the normal entry point for simple programs that use `std/event`
 directly.
 
-Channels and timers keep the loop alive by default. Pass `keepsAlive: false` for
-passive sources that should run only while some other keep-alive source is
-present or while a host explicitly drains work.
+### `retainMainEventLoop()`
+
+```doof
+hold := retainMainEventLoop()
+// ...later, once the awaited event has been handled:
+hold.release()
+```
+
+Keeps `runMainEventLoop()` running until the hold is released or dropped. Use it
+when the next event comes from somewhere the loop cannot see, such as a reply
+that will be posted from another thread. `release()` returns `true` only for the
+call that released the hold.
 
 ### `drainMainEventLoop()`
 
@@ -270,7 +132,7 @@ game, or platform host.
 ### `setMainEventWakeHandler(...)`
 
 ```doof
-setMainEventWakeHandler((): void => {
+setMainEventWakeHandler((): none => {
   // Post to the host main thread, then call drainMainEventLoop() there.
 })
 
@@ -296,7 +158,7 @@ the main event loop.
 ```doof
 timer := setTimeout{
   delay: Duration.ofMillis(250L),
-  handler: (): void => println("later"),
+  handler: (): none => println("later"),
   keepsAlive: true,
 }
 ```
@@ -313,7 +175,7 @@ Runs `handler` once after `delay`.
 ```doof
 timer := setInterval{
   interval: Duration.ofSeconds(1L),
-  handler: (): void => println("tick"),
+  handler: (): none => println("tick"),
 }
 ```
 
@@ -334,47 +196,19 @@ completed, or, for a one-shot timer, already committed to dispatch.
 
 ## API Map
 
-### Channels
-
-```doof
-enum Backpressure {
-  None,
-  High,
-}
-
-enum SendError {
-  Full,
-  Closed,
-}
-
-class ChannelSender<T> {
-  send(value: T, key: string | null = null): Result<Backpressure, SendError>
-  onReady(handler: (): void): void
-  onClosed(handler: (): void): void
-  close(): void
-}
-
-class ChannelReceiver<T> {
-  onMessage(handler: (value: T): void): void
-  onClosed(handler: (): void): void
-  close(): void
-}
-
-createChannel<T>(
-  capacity: int = 256,
-  highWater: int = 0,
-  lowWater: int = -1,
-  keepsAlive: bool = true,
-): Tuple<ChannelSender<T>, ChannelReceiver<T> >
-```
-
 ### Event Loop
 
 ```doof
-runMainEventLoop(): void
+runMainEventLoop(): none
 drainMainEventLoop(): int
-setMainEventWakeHandler(handler: (): void): void
-clearMainEventWakeHandler(): void
+setMainEventWakeHandler(handler: (): none): none
+clearMainEventWakeHandler(): none
+
+class MainEventLoopHold {
+  release(): bool
+}
+
+retainMainEventLoop(): MainEventLoopHold
 ```
 
 ### Timers
@@ -386,13 +220,13 @@ class Timer {
 
 setTimeout(
   delay: Duration,
-  handler: (): void,
+  handler: (): none,
   keepsAlive: bool = true,
 ): Timer
 
 setInterval(
   interval: Duration,
-  handler: (): void,
+  handler: (): none,
   keepsAlive: bool = true,
 ): Timer
 ```
